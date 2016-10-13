@@ -21,11 +21,14 @@ import hashlib
 import logging
 import tempfile
 import argparse
-import traceback
 import functools
 import threading
 import subprocess
-import Queue as queue
+
+try:
+    import Queue as queue
+except ImportError:
+    import queue
 
 
 logger = logging.getLogger('agent')
@@ -45,6 +48,8 @@ def setup_logger(opts):
 
 
 class Proc(object):
+    "Background process class"
+
     STDOUT = 0
     STDERR = 1
     EXIT_CODE = 2
@@ -200,78 +205,27 @@ def get_updates(proc_id):
     return ecode, d_out, d_err
 
 
-def fork_to_daemon(working_dir="/tmp"):
-    try:
-        pid = os.fork()
-        if pid > 0:
-            # return to parent
-            return False
-    except OSError as e:
-        sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
-        sys.exit(1)
-
-    # decouple from parent environment
-    os.setsid()
-
-    # do second fork
-    try:
-        pid = os.fork()
-        if pid > 0:
-            # exit from 1st children parent
-            # use os._exit to aviod calling atexit functions
-            os._exit(0)
-    except OSError as e:
-        sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
-        sys.exit(1)
-
-    os.chdir(working_dir)
-    os.umask(0)
-    return True
-
-
-def redirect_streams(stdin, stdout, stderr):
-    # redirect standard file descriptors
-    sys.stdout.flush()
-    sys.stderr.flush()
-
-    mode = os.O_CREAT | os.O_APPEND
-    if stdout == stderr:
-        out_fd = err_fd = os.open(stdout, mode)
-    else:
-        out_fd = os.open(stdout, mode)
-        err_fd = os.open(stderr, mode)
-
-    os.close(sys.stdin.fileno())
-    os.close(sys.stdout.fileno())
-    os.close(sys.stderr.fileno())
-
-    if stdin is not None:
-        os.dup2(os.open(stdin, os.O_RDONLY), sys.stdin.fileno())
-
-    os.dup2(out_fd, sys.stdout.fileno())
-    os.dup2(err_fd, sys.stderr.fileno())
-
-
-class ConnectionClosed(Exception):
-    def __init__(self, data):
-        self.data = data
-        self.data_len = len(data)
-
-
 class RawData(object):
     def __init__(self, data=None, idx=None):
         self.data = data
         self.idx = idx
 
 
+class ConnectionClosed(Exception):
+    pass
+
+
 class Transport(object):
-    timeout = 30
+    TIMEOUT = 30
     size_s = struct.Struct("!I")
     min_blob_size = 64
 
-    def __init__(self, sock):
+    def __init__(self, sock, timeout=None):
         self.sock = sock
-        self.sock.settimeout(self.timeout)
+        if timeout is None:
+            self.sock.settimeout(self.TIMEOUT)
+        else:
+            self.sock.settimeout(timeout)
 
     def close(self):
         self.sock.shutdown(socket.SHUT_RDWR)
@@ -349,7 +303,10 @@ class Transport(object):
         data = ""
 
         while size != len(data):
-            data += self.sock.recv(size - len(data))
+            ndata = self.sock.recv(size - len(data))
+            if not ndata:
+                raise ConnectionClosed()
+            data += ndata
 
         return data
 
@@ -417,25 +374,34 @@ def format_func_call(name, args, kwargs):
     return "{0}({1})".format(name, ", ".join(params))
 
 
-def rpc_master(transport, call_map):
-    while True:
-        name, args, kwargs = transport.recv_message()
-        logger.info("RPC request " + format_func_call(name, args, kwargs))
+def rpc_master(transport, call_map, thid, queue):
+    res = True
+    try:
+        while True:
+            name, args, kwargs = transport.recv_message()
+            logger.info("RPC request " + format_func_call(name, args, kwargs))
 
-        if name not in call_map:
-            res = False, NameError(name)
-            logger.error("Unknown name {0!r}".format(name))
-        else:
-            try:
-                res = True, call_map[name](*args, **kwargs)
-            except SystemExit:
-                transport.send_message(None, [True, None], {})
-                raise
-            except Exception as exc:
-                res = False, exc
+            if name not in call_map:
+                res = False, NameError(name)
+                logger.error("Unknown name {0!r}".format(name))
+            else:
+                try:
+                    res = True, call_map[name](*args, **kwargs)
+                except Exception as exc:
+                    res = False, exc
 
-        logger.info("Done, sending responce: " + val_to_str(res))
-        transport.send_message(None, res, {})
+            logger.info("Done, sending responce: " + val_to_str(res[1]))
+            transport.send_message(None, res, {})
+    except ConnectionClosed:
+        logger.info("Connection closed")
+    except SystemExit:
+        transport.send_message(None, [True, None], {})
+        res = False
+    except Exception:
+        logger.exception("During processing client")
+    finally:
+        transport.close()
+    queue.put((thid, res))
 
 
 def make_cert_and_key(key_file=None, cert_file=None,
@@ -508,96 +474,193 @@ def load_plugins(opts):
     return res
 
 
-def server_main(opts):
+def validate_server_options(opts):
     if opts.key_file and not opts.cert_file:
-        print("Must pass cert file with key file")
-        return 1
+        logger.error("Must pass cert file with key file")
+        return False
 
     if not re.match(r".*:\d+", opts.listen_addr):
-        print("Wrong listen addr")
-        return 1
+        logger.error("Wrong listen addr")
+        return False
 
     host, port = opts.listen_addr.split(":")
+    port = int(port)
+
+    if port > (2 ** 16 - 1):
+        logger.error("Wrong port")
+        return False
+
     try:
         socket.gethostbyname(host)
     except socket.gaierror:
-        print("Can't resolve host in listen addr")
-        return 1
+        logger.error("Can't resolve host in listen addr")
+        return False
 
-    if opts.log_file is None:
-        if hasattr(os, 'devnull'):
-            log_file = os.devnull
+    return True
+
+
+# ---------------------  daemonization ----------------------------------------
+
+class Demonizator(object):
+    def __init__(self, working_dir="/tmp", stdout=None, stderr=None):
+        self.working_dir = working_dir
+        self.stdout = stdout
+        self.stderr = stderr
+        self.wpipe = None
+
+    def two_fork(self):
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # return to parent
+                return False
+        except OSError as e:
+            sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+
+        # decouple from parent environment
+        os.setsid()
+
+        # do second fork
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # exit from 1st children parent
+                # use os._exit to aviod calling atexit functions
+                os._exit(0)
+        except OSError as e:
+            sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.exit(1)
+
+        os.chdir(self.working_dir)
+        os.umask(0)
+        return True
+
+    def redirect_streams(self):
+        # redirect standard file descriptors
+        mode = os.O_CREAT | os.O_APPEND
+        if self.stdout == self.stderr:
+            out_fd = err_fd = os.open(self.stdout, mode)
         else:
-            log_file = '/dev/null'
-    else:
-        log_file = opts.log_file
+            out_fd = os.open(self.stdout, mode)
+            err_fd = os.open(self.stderr, mode)
 
-    call_map = load_plugins(opts)
+        sys.stdout.flush()
+        sys.stderr.flush()
 
-    if opts.daemon:
-        rpipe, wpipe = os.pipe()
+        os.close(sys.stdin.fileno())
+        os.close(sys.stdout.fileno())
+        os.close(sys.stderr.fileno())
 
-        is_daemon = fork_to_daemon(working_dir=opts.working_dir)
+        os.dup2(out_fd, sys.stdout.fileno())
+        os.dup2(err_fd, sys.stderr.fileno())
 
-        if is_daemon:
+    def daemonize(self):
+        rpipe, self.wpipe = os.pipe()
+
+        is_daemon = self.two_fork()
+
+        if not is_daemon:
+            os.close(self.wpipe)
+            # read untill stream would be closed
+            sz = struct.calcsize("I") + 1
+            (dpid,) = struct.unpack("I", os.read(rpipe, sz))
             os.close(rpipe)
+            return dpid
+
+        os.close(rpipe)
+        self.redirect_streams()
+        os.write(self.wpipe, struct.pack("I", os.getpid()))
+        return
+
+    def daemon_ready(self):
+        os.close(self.wpipe)
+
+    def exit_parent(self):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
+
+def get_log_file(opts):
+    if opts.stdout_file is None:
+        if hasattr(os, 'devnull'):
+            return os.devnull
         else:
-            os.close(wpipe)
-            # read settings even if will not show them
-            # to be sure, that parent return not early than
-            # child will ready to accept connection
-            settings = os.read(rpipe, 64 * 1024)
+            return '/dev/null'
+    else:
+        return opts.stdout_file
+
+
+def get_call_map(opts):
+    call_map = load_plugins(opts)
+    call_map['cli.spawn'] = spawn
+    call_map['cli.get_updates'] = get_updates
+    call_map['server.stop'] = stop_server
+    call_map['server.rpc_info'] = functools.partial(get_calls_info, call_map)
+    return call_map
+
+
+def server_main(opts):
+    if opts.daemon:
+        log_file = get_log_file(opts)
+        demonizator = Demonizator(opts.working_dir, log_file, log_file)
+        daemon_pid = demonizator.daemonize()
+        if daemon_pid is not None:
+            settings = json.dumps({"daemon_pid": daemon_pid})
             if opts.show_settings == '-':
                 print(settings)
-                # os._exit doesn't flush stdXXX
-                sys.stdout.flush()
             elif opts.show_settings:
                 with open(opts.show_settings, "w") as sett_fd:
                     sett_fd.write(settings)
-            os.close(rpipe)
-            # have to use os._exit to avoid atexit calls
-            os._exit(0)
-
-        redirect_streams(stdin=None, stdout=log_file, stderr=log_file)
+            demonizator.exit_parent()
     elif opts.show_settings:
         logger.warning("--show-settings option ignored for non-daemon mode")
 
     logger.info("Start listening on {0}".format(opts.listen_addr))
-    sock = None
+    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
     try:
-        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
         srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        host, port = opts.listen_addr.split(":")
         srv_sock.bind((host, int(port)))
-        srv_sock.listen(1)
+        srv_sock.listen(3)
 
-        call_map['cli.spawn'] = spawn
-        call_map['cli.get_updates'] = get_updates
-        call_map['server.stop'] = stop_server
-        call_map['server.rpc_info'] = functools.partial(get_calls_info, call_map)
+        # signal to parent process, that prepartion done
+        if opts.daemon:
+            demonizator.daemon_ready()
+
+        call_map = get_call_map(opts)
 
         logger.info("Ready")
-        logger.debug(
-            pprint.pformat(call_map)
-        )
+        logger.debug(pprint.pformat(call_map))
 
-        if opts.daemon and opts.show_settings:
-            settings = {
-                "addr": opts.listen_addr,
-                "pid": os.getpid(),
-                "working_dir": opts.working_dir,
-                "log_file": log_file if log_file not in ('/dev/null', os.devnull) else None,
-            }
-            jsett = json.dumps(settings, sort_keys=True,
-                               indent=4, separators=(',', ': '))
-            os.write(wpipe, jsett)
-            os.close(wpipe)
+        thread_id = 0
+        active_threads = {}
+        last_connection_at = time.time()
+        res_queue = queue.Queue()
+        done = False
 
         while True:
-            r, _, _ = select.select([srv_sock], [], [], opts.timeout)
+            # if there a results
+            while len(active_threads) >= opts.max_connections or not res_queue.empty():
+                th_id, res = res_queue.get()
+                if not res:
+                    done = True
+                active_threads.pop(th_id).join()
+
+            if done:
+                break
+
+            r, _, _ = select.select([srv_sock], [], [], 0.01)
             if not r:
-                logger.warning("Communication timeout. Exiting")
-                return
+                conn_timeout = time.time() - last_connection_at
+                if opts.timeout <= conn_timeout and not active_threads:
+                    logger.info("Communication timeout. Exiting")
+                    return
+                continue
+
+            last_connection_at = time.time()
 
             sock, fromaddr = srv_sock.accept()
             logger.info("Get connection from {0}".format(fromaddr))
@@ -607,29 +670,25 @@ def server_main(opts):
                                        certfile=opts.cert_file,
                                        keyfile=opts.key_file)
 
-            try:
-                rpc_master(Transport(sock), call_map)
-            except SystemExit:
-                return
-            except Exception:
-                logger.exception("During processing client")
-            logger.info("Client {0!r} disconnected".format(fromaddr))
-            sock.close()
-            sock = None
-    except Exception as exc:
-        with open(log_file, "a+") as fd:
-            fd.write(traceback.format_exc(exc))
-        raise
+            th = threading.Thread(target=rpc_master,
+                                  args=(Transport(sock), call_map, thread_id, res_queue))
+            th.daemon = True
+            th.start()
+            active_threads[thread_id] = th
+            thread_id += 1
+    except Exception:
+        logger.exception("")
     finally:
         srv_sock.close()
-        if sock is not None:
-            sock.close()
 
 
-def connect(addr, key_file=None, cert_file=None):
+def connect(addr, key_file=None, cert_file=None, conn_timeout=5, timeout=None):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     host, port = addr
+
+    sock.settimeout(conn_timeout)
     sock.connect((host, int(port)))
+    sock.settimeout(None)
 
     if key_file:
         sock = ssl.wrap_socket(sock,
@@ -637,7 +696,7 @@ def connect(addr, key_file=None, cert_file=None):
                                certfile=cert_file,
                                keyfile=key_file)
 
-    return SimpleRPCClient(Transport(sock))
+    return SimpleRPCClient(Transport(sock, timeout=timeout))
 
 
 def client_main(opts):
@@ -648,14 +707,8 @@ def client_main(opts):
     )
 
     with rpc:
-        if opts.name == 'spawn':
-            cmd_id = rpc.spawn(opts.params[0])
-            print("CMD ID = {0!r}".format(cmd_id))
-        elif opts.name == 'get_updates':
-            code, out, err = rpc.get_updates(int(opts.params[0]))
-            print(code, out, err)
-        elif opts.name == 'list':
-            print(rpc._rpc_info())
+        if opts.name == 'server.rpc_info':
+            print(rpc.server.rpc_info())
         else:
             print("Uknown cmd {0!r}".format(opts.name))
 
@@ -667,17 +720,19 @@ def parse_args(argv):
 
     parser.add_argument("-k", "--key-file", default=None)
     parser.add_argument("-c", "--cert-file", default=None)
+    parser.add_argument("--log-level", default="DEBUG",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    parser.add_argument("--log-config", default=None)
 
     server_parser = subparsers.add_parser('server', help='start a serving daemon')
     server_parser.add_argument("-l", "--listen-addr", required=True)
+    server_parser.add_argument("-m", "--max-connections", default=16)
+
     server_parser.add_argument("-p", "--plugin", action='append', default=[])
     server_parser.add_argument("--timeout", type=int, default=300,
                                help="exit if have no successfull connection in this timeout")
     server_parser.add_argument("-d", "--daemon", action="store_true", help="became a daemon")
-    server_parser.add_argument("--log-level", default="DEBUG",
-                               choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
-    server_parser.add_argument("--log-config", default=None)
-    server_parser.add_argument("--log-file", default=None)
+    server_parser.add_argument("--stdout-file", default=None)
     server_parser.add_argument("-s", "--show-settings", default=None, nargs='?', const='-',
                                help="dump settings dict after demonization, not used in other cases")
     server_parser.add_argument("--working-dir", default="/tmp",
@@ -705,7 +760,8 @@ def main(argv):
     setup_logger(opts)
 
     if opts.subparser_name == 'server':
-        return server_main(opts)
+        if validate_server_options(opts):
+            return server_main(opts)
     elif opts.subparser_name == 'call':
         return client_main(opts)
     elif opts.subparser_name == 'keygen':
