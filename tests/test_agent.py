@@ -19,7 +19,9 @@ except ImportError:
 import pytest
 
 from agent import agent
+
 import plugin1
+import plugin2
 
 # ------------------    HELPERS    -------------------------------------------
 
@@ -163,7 +165,7 @@ def spawn_server(**params):
                                 default_params.get('cert-file'),
                                 timeout=1)
         except Exception:
-            os.kill(asett['pid'], signal.SIGKILL)
+            os.kill(asett['daemon_pid'], signal.SIGKILL)
             print(open(log_name).read())
             raise
 
@@ -383,3 +385,10 @@ def test_real_server_plugins():
     plugin_path = plugin1.__file__.replace(".pyc", ".py")
     with spawn_server(plugin=plugin_path) as rpc:
         assert rpc.pl1.add(1, 2) == 3
+
+
+def test_real_server_timeout():
+    plugin_path = plugin2.__file__.replace(".pyc", ".py")
+    with spawn_server(plugin=plugin_path) as rpc:
+        with pytest.raises(socket.timeout):
+            rpc.pl2.timeout(10, _recv_timeout=1)

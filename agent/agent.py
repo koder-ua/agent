@@ -12,7 +12,6 @@ except ImportError:
 import sys
 import json
 import time
-import pprint
 import select
 import pickle
 import socket
@@ -24,12 +23,15 @@ import argparse
 import functools
 import threading
 import subprocess
+from pprint import pprint, pformat
 
 try:
     import Queue as queue
 except ImportError:
     import queue
 
+
+# ----------------------------- LOGGING --------------------------------------------------------------------------------
 
 logger = logging.getLogger('agent')
 
@@ -45,6 +47,40 @@ def setup_logger(opts):
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         ch.setFormatter(formatter)
         logger.addHandler(ch)
+
+# ----------------------------- LOAD PLUGINS ---------------------------------------------------------------------------
+
+
+RPC_TEMPO_MOD = "__rpc_temporary_module__"
+
+
+if sys.version_info < (3, 0):
+    import imp
+
+    def load_py(path):
+        mod = imp.load_source(RPC_TEMPO_MOD, path)
+        del sys.modules[RPC_TEMPO_MOD]
+        return mod
+
+elif sys.version_info < (3, 4):
+    from importlib.machinery import SourceFileLoader
+
+    def load_py(path):
+        mod = SourceFileLoader(RPC_TEMPO_MOD, path).load_module()
+        del sys.modules[RPC_TEMPO_MOD]
+        return mod
+else:
+    import importlib.util
+
+    def load_py(path):
+        spec = importlib.util.spec_from_file_location(RPC_TEMPO_MOD, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        del sys.modules[RPC_TEMPO_MOD]
+        return mod
+
+
+# ----------------------------- PROC CONTROL ---------------------------------------------------------------------------
 
 
 class Proc(object):
@@ -174,35 +210,7 @@ class Proc(object):
         self.proc.kill()
 
 
-procs_lock = threading.Lock()
-proc_id = 0
-procs = {}
-
-
-def spawn(cmd, timeout=None, input_data=None):
-    global proc_id
-
-    proc = Proc(cmd, timeout, input_data)
-    proc.spawn()
-
-    with procs_lock:
-        curr_id = proc_id
-        proc_id += 1
-        procs[curr_id] = proc
-
-    return curr_id
-
-
-def get_updates(proc_id):
-    with procs_lock:
-        proc = procs[proc_id]
-
-    ecode, d_out, d_err = proc.get_updates()
-
-    if ecode is not None:
-        with procs_lock:
-            del procs[proc_id]
-    return ecode, d_out, d_err
+# ---------------------------------------------  TRANSPORT PROTO -------------------------------------------------------
 
 
 class RawData(object):
@@ -232,7 +240,7 @@ class Transport(object):
         self.sock.close()
         self.sock = None
 
-    def send_message(self, name, args, kwargs):
+    def send_message(self, name, args, kwargs, timeout=None):
         blobs = []
         new_args = []
         for obj in args:
@@ -257,7 +265,7 @@ class Transport(object):
         md5 = hashlib.md5()
         md5.update(message_s)
 
-        self.send(message_s)
+        self.send(message_s, timeout)
 
         for blob in blobs:
             md5.update(blob)
@@ -265,10 +273,10 @@ class Transport(object):
 
         self.send(md5.digest())
 
-    def recv_message(self):
+    def recv_message(self, timeout=None):
         md5 = hashlib.md5()
 
-        data_sz_s = self.recv(self.size_s.size)
+        data_sz_s = self.recv(self.size_s.size, timeout)
         md5.update(data_sz_s)
         data_sz, = self.size_s.unpack(data_sz_s)
 
@@ -299,8 +307,13 @@ class Transport(object):
 
         return name, tuple(new_args), new_kwargs
 
-    def recv(self, size):
-        data = ""
+    def recv(self, size, timeout=None):
+        data = b""
+
+        if timeout:
+            r, _, _ = select.select([self.sock], [], [], timeout)
+            if not r:
+                raise socket.timeout("Recv start timeout")
 
         while size != len(data):
             ndata = self.sock.recv(size - len(data))
@@ -310,41 +323,23 @@ class Transport(object):
 
         return data
 
-    def send(self, data):
-        self.sock.sendall(data)
+    def send(self, data, timeout=None):
+        if not timeout:
+            self.sock.sendall(data)
+            return
+
+        etime = time.time() + timeout
+        while True:
+            tleft = etime - time.time()
+            _, w, _ = select.select([], [self.sock], [], tleft)
+            if not w:
+                raise socket.timeout("Send timeout")
+
+            send_bytes = self.sock.send(data)
+            data = data[send_bytes:]
 
 
-class SimpleRPCClient(object):
-    def __init__(self, transport, name=None):
-        self._tr = transport
-        self._name = name
-
-    def __call__(self, *args, **kwargs):
-        if self._name is None:
-            raise ValueError("Can't call empty name")
-
-        self._tr.send_message(self._name, args, kwargs)
-        name, (ok, res), kwargs = self._tr.recv_message()
-        assert name is None
-        assert kwargs == {}
-
-        if ok:
-            return res
-
-        assert isinstance(res, Exception)
-        raise res
-
-    def __getattr__(self, name):
-        if self._name is not None:
-            name = self._name + '.' + name
-        return self.__class__(self._tr, name)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, x, y, z):
-        self._tr.close()
-        self._tr = None
+# -----------------------------------------------------
 
 
 def val_to_str(val, max_str_len=20):
@@ -404,74 +399,19 @@ def rpc_master(transport, call_map, thid, queue):
     queue.put((thid, res))
 
 
-def make_cert_and_key(key_file=None, cert_file=None,
-                      subj="/C=NN/ST=Some/L=Some/O=Ceph-monitor/OU=Ceph-monitor/CN=mirantis.com"):
-
-    if key_file is None:
-        key_file = tempfile.mktemp()
-
-    if cert_file is None:
-        cert_file = tempfile.mktemp()
-
-    os.close(os.open(key_file, os.O_WRONLY | os.O_CREAT, 0o600))
-    os.close(os.open(cert_file, os.O_WRONLY | os.O_CREAT, 0o600))
-
-    subprocess.check_call("openssl genrsa 1024 2>/dev/null > " + key_file, shell=True)
-    subprocess.check_call('openssl req -new -x509 -nodes -sha1 -days 365 ' +
-                          '-key "{0}" -subj "{1}" > {2} 2>/dev/null'.format(key_file, subj, cert_file),
-                          shell=True)
-
-    return key_file, cert_file
-
-
-def get_calls_info(call_map):
-    return list(call_map)
-
-
-def stop_server():
-    logger.info("Stop requested. Exiting")
-    raise SystemExit()
-
-
-tname = "_.x"
-if sys.version_info < (3, 0):
-    import imp
-
-    def load_py(path):
-        mod = imp.load_source(tname, path)
-        del sys.modules[tname]
-        return mod
-elif sys.version_info < (3, 4):
-    from importlib.machinery import SourceFileLoader
-
-    def load_py(path):
-        mod = SourceFileLoader(tname, path).load_module()
-        del sys.modules[tname]
-        return mod
-else:
-    import importlib.util
-
-    def load_py(path):
-        spec = importlib.util.spec_from_file_location(tname, path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        del sys.modules[tname]
-        return mod
-
-
-def load_plugins(opts):
+def find_rpc_funcs(dct):
     rpc_prefix = "rpc_"
     rpc_prefix_len = len(rpc_prefix)
+    mod_name = dct['RPC_MODULE']
+    for name, val in dct.items():
+        if name.startswith(rpc_prefix):
+            yield (mod_name + "." + name[rpc_prefix_len:]), val
 
-    res = {}
-    for fname in opts.plugin:
-        mod = load_py(fname)
-        mod_name = getattr(mod, 'RPC_MODULE')
-        for name in dir(mod):
-            if name.startswith(rpc_prefix):
-                res[mod_name + "." + name[rpc_prefix_len:]] = getattr(mod, name)
 
-    return res
+def load_plugin(fname):
+    mod = load_py(fname)
+    del mod.__dict__['__builtins__']
+    return dict(find_rpc_funcs(mod.__dict__))
 
 
 def validate_server_options(opts):
@@ -499,9 +439,9 @@ def validate_server_options(opts):
     return True
 
 
-# ---------------------  daemonization ----------------------------------------
+# ----------------------------------  Daemonization ---------------------------------------------------------------------
 
-class Demonizator(object):
+class Daemonizator(object):
     def __init__(self, working_dir="/tmp", stdout=None, stderr=None):
         self.working_dir = working_dir
         self.stdout = stdout
@@ -582,6 +522,79 @@ class Demonizator(object):
         os._exit(0)
 
 
+# ---------------------------------  BUILD-IN RPC METHODS  -------------------------------------------------------------
+
+
+procs_lock = threading.Lock()
+proc_id = 0
+procs = {}
+
+
+def spawn(cmd, timeout=None, input_data=None):
+    global proc_id
+
+    proc = Proc(cmd, timeout, input_data)
+    proc.spawn()
+
+    with procs_lock:
+        curr_id = proc_id
+        proc_id += 1
+        procs[curr_id] = proc
+
+    return curr_id
+
+
+def get_updates(proc_id):
+    with procs_lock:
+        proc = procs[proc_id]
+
+    ecode, d_out, d_err = proc.get_updates()
+
+    if ecode is not None:
+        with procs_lock:
+            del procs[proc_id]
+    return ecode, d_out, d_err
+
+
+def load_module(call_map, module_name, module_content):
+    lc = {}
+    eval(compile(module_content, module_name, 'exec'), globals(), lc)
+    call_map.update(find_rpc_funcs(lc))
+    logger.info("New module {!r} with methods {} loaded".format(
+        module_name, ",".join(lc.keys())))
+
+
+def load_module_fc(call_map, module_path):
+    new_methods = load_plugin(module_path)
+    call_map.update(new_methods)
+    logger.info("New module from {!r} with methods {} loaded".format(
+        module_path, ",".join(new_methods.keys())))
+
+
+def get_calls_info(call_map):
+    return list(sorted(list(call_map)))
+
+
+def stop_server():
+    logger.info("Stop requested. Exiting")
+    raise SystemExit()
+
+
+def get_file(path):
+    return open(path, "rb").read()
+
+
+def store_file(path, content):
+    with open(path, "wb") as fd:
+        fd.write(content)
+
+
+def file_exists(path):
+    return os.path.exists(path)
+
+# -------------------------------- RPC SERVER --------------------------------------------------------------------------
+
+
 def get_log_file(opts):
     if opts.stdout_file is None:
         if hasattr(os, 'devnull'):
@@ -593,19 +606,31 @@ def get_log_file(opts):
 
 
 def get_call_map(opts):
-    call_map = load_plugins(opts)
-    call_map['cli.spawn'] = spawn
-    call_map['cli.get_updates'] = get_updates
+    call_map = {}
+
+    for fname in opts.plugin:
+        call_map.update(load_plugin(fname))
+
     call_map['server.stop'] = stop_server
     call_map['server.rpc_info'] = functools.partial(get_calls_info, call_map)
+    call_map['server.load_module'] = functools.partial(load_module, call_map)
+    call_map['server.load_module_fl'] = functools.partial(load_module, call_map)
+
+    call_map['cli.spawn'] = spawn
+    call_map['cli.get_updates'] = get_updates
+
+    call_map['fs.get_file'] = get_file
+    call_map['fs.store_file'] = store_file
+    call_map['fs.file_exists'] = file_exists
+
     return call_map
 
 
 def server_main(opts):
     if opts.daemon:
         log_file = get_log_file(opts)
-        demonizator = Demonizator(opts.working_dir, log_file, log_file)
-        daemon_pid = demonizator.daemonize()
+        daemonizator = Daemonizator(opts.working_dir, log_file, log_file)
+        daemon_pid = daemonizator.daemonize()
         if daemon_pid is not None:
             settings = json.dumps({"daemon_pid": daemon_pid})
             if opts.show_settings == '-':
@@ -613,7 +638,7 @@ def server_main(opts):
             elif opts.show_settings:
                 with open(opts.show_settings, "w") as sett_fd:
                     sett_fd.write(settings)
-            demonizator.exit_parent()
+            daemonizator.exit_parent()
     elif opts.show_settings:
         logger.warning("--show-settings option ignored for non-daemon mode")
 
@@ -621,6 +646,8 @@ def server_main(opts):
     srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     try:
+        call_map = get_call_map(opts)
+
         srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         host, port = opts.listen_addr.split(":")
         srv_sock.bind((host, int(port)))
@@ -628,12 +655,10 @@ def server_main(opts):
 
         # signal to parent process, that prepartion done
         if opts.daemon:
-            demonizator.daemon_ready()
-
-        call_map = get_call_map(opts)
+            daemonizator.daemon_ready()
 
         logger.info("Ready")
-        logger.debug(pprint.pformat(call_map))
+        logger.debug(pformat(call_map.keys()))
 
         thread_id = 0
         active_threads = {}
@@ -682,6 +707,52 @@ def server_main(opts):
         srv_sock.close()
 
 
+# -------------------------------   API  -------------------------------------------------------------------------------
+
+
+class SimpleRPCClient(object):
+    def __init__(self, transport, name=None):
+        self._tr = transport
+        self._name = name
+
+    def __call__(self, *args, **kwargs):
+        if self._name is None:
+            raise ValueError("Can't call empty name")
+
+        if '_send_timeout' in kwargs:
+            send_timeout = kwargs.pop("_send_timeout")
+        else:
+            send_timeout = None
+
+        if '_recv_timeout' in kwargs:
+            recv_timeout = kwargs.pop("_recv_timeout")
+        else:
+            recv_timeout = None
+
+        self._tr.send_message(self._name, args, kwargs, timeout=send_timeout)
+        name, (ok, res), kwargs = self._tr.recv_message(timeout=recv_timeout)
+        assert name is None
+        assert kwargs == {}
+
+        if ok:
+            return res
+
+        assert isinstance(res, Exception)
+        raise res
+
+    def __getattr__(self, name):
+        if self._name is not None:
+            name = self._name + '.' + name
+        return self.__class__(self._tr, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, x, y, z):
+        self._tr.close()
+        self._tr = None
+
+
 def connect(addr, key_file=None, cert_file=None, conn_timeout=5, timeout=None):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     host, port = addr
@@ -699,6 +770,15 @@ def connect(addr, key_file=None, cert_file=None, conn_timeout=5, timeout=None):
     return SimpleRPCClient(Transport(sock, timeout=timeout))
 
 
+# ----------------------------------------------  CLI hendlers ---------------------------------------------------------
+
+
+def parse_type(val):
+    if re.match(r"-?\d+", val):
+        return int(val)
+    return val
+
+
 def client_main(opts):
     rpc = connect(
         addr=opts.server_addr.split(":"),
@@ -707,10 +787,30 @@ def client_main(opts):
     )
 
     with rpc:
-        if opts.name == 'server.rpc_info':
-            print(rpc.server.rpc_info())
-        else:
-            print("Uknown cmd {0!r}".format(opts.name))
+        for part in opts.name.split("."):
+            rpc = getattr(rpc, part)
+
+        pprint(rpc(*map(parse_type, opts.params)))
+
+
+def make_cert_and_key(key_file=None, cert_file=None,
+                      subj="/C=NN/ST=Some/L=Some/O=Ceph-monitor/OU=Ceph-monitor/CN=mirantis.com"):
+
+    if key_file is None:
+        key_file = tempfile.mktemp()
+
+    if cert_file is None:
+        cert_file = tempfile.mktemp()
+
+    os.close(os.open(key_file, os.O_WRONLY | os.O_CREAT, 0o600))
+    os.close(os.open(cert_file, os.O_WRONLY | os.O_CREAT, 0o600))
+
+    subprocess.check_call("openssl genrsa 1024 2>/dev/null > " + key_file, shell=True)
+    subprocess.check_call('openssl req -new -x509 -nodes -sha1 -days 365 ' +
+                          '-key "{0}" -subj "{1}" > {2} 2>/dev/null'.format(key_file, subj, cert_file),
+                          shell=True)
+
+    return key_file, cert_file
 
 
 def parse_args(argv):
@@ -734,9 +834,9 @@ def parse_args(argv):
     server_parser.add_argument("-d", "--daemon", action="store_true", help="became a daemon")
     server_parser.add_argument("--stdout-file", default=None)
     server_parser.add_argument("-s", "--show-settings", default=None, nargs='?', const='-',
-                               help="dump settings dict after demonization, not used in other cases")
+                               help="dump settings dict after daemonization, not used in other cases")
     server_parser.add_argument("--working-dir", default="/tmp",
-                               help="cd to this directory after demonization, not used in other cases")
+                               help="cd to this directory after daemonization, not used in other cases")
     server_parser.add_argument("--id", default="", help="Used only to find a process")
     server_parser.set_defaults(subparser_name="server")
 
