@@ -12,24 +12,26 @@ except ImportError:
 import sys
 import json
 import time
-import select
 import pickle
+import select
 import socket
 import struct
 import hashlib
 import logging
 import tempfile
 import argparse
+import traceback
 import functools
 import threading
 import subprocess
 from pprint import pprint, pformat
 
-try:
+if sys.version < (3, 0, 0):
     import Queue as queue
-except ImportError:
+    from StringIO import StringIO as BytesIO
+else:
     import queue
-
+    from io import BytesIO
 
 # ----------------------------- LOGGING --------------------------------------------------------------------------------
 
@@ -38,7 +40,10 @@ logger = logging.getLogger('agent')
 
 def setup_logger(opts):
     if opts.log_config:
-        logging.config.fileConfig(opts.log_config)
+        if sys.version > (3, 0, 0):
+            logging.config.fileConfig(opts.log_config)
+        else:
+            raise ValueError("Python 2.X doesn't support logger config")
     else:
         level = getattr(logging, opts.log_level)
         logger.setLevel(level)
@@ -80,143 +85,157 @@ else:
         return mod
 
 
-# ----------------------------- PROC CONTROL ---------------------------------------------------------------------------
-
-
-class Proc(object):
-    "Background process class"
-
-    STDOUT = 0
-    STDERR = 1
-    EXIT_CODE = 2
-    term_timeout = 1
-    kill_timeout = 1
-
-    RUNNING = 0
-    TERM_SEND = 1
-    KILL_SEND = 2
-
-    def __init__(self, cmd, timeout, input_data=None, merge_out=True):
-        self.input_data = input_data
-        self.cmd = cmd
-        self.timeout = timeout
-        self.merge_out = merge_out
-
-        self.proc = None
-        self.end_time = None
-        self.input_file = None
-        self.output_q = None
-        self.state = None
-
-    def spawn(self):
-        if self.input_data:
-            self.input_file = tempfile.TemporaryFile(prefix="inp_data")
-
-        if self.merge_out:
-            stderr = subprocess.STDOUT
-        else:
-            stderr = subprocess.PIPE
-
-        self.proc = subprocess.Popen(self.cmd,
-                                     shell=isinstance(self.cmd, basestring),
-                                     stdout=subprocess.PIPE,
-                                     stderr=stderr,
-                                     stdin=self.input_file)
-        self.state = self.RUNNING
-        self.output_q = queue.Queue()
-
-        if self.timeout:
-            self.end_time = time.time() + self.timeout
-
-        if self.input_data:
-            self.input_file.write(self.input_data)
-            self.input_file.close()
-
-        watch_th = threading.Thread(target=self.watch_proc_th)
-        watch_th.daemon = True
-        watch_th.start()
-
-    def on_timeout(self):
-        if self.state == self.RUNNING:
-            self.term()
-            self.end_time = time.time() + self.term_timeout
-        elif self.state == self.TERM_SEND:
-            self.kill()
-            self.end_time = time.time() + self.kill_timeout
-        else:
-            assert self.state == self.KILL_SEND
-            raise RuntimeError("Can't kill process")
-
-    def watch_proc_th(self):
-        if self.merge_out:
-            all_pipes = [self.proc.stdout]
-        else:
-            all_pipes = [self.proc.stdout, self.proc.stderr]
-
-        # set non-blocking
-
-        while all_pipes:
-            if self.end_time is not None:
-                timeout = self.end_time - time.time()
-            else:
-                timeout = None
-
-            r, _, e = select.select(all_pipes, [], all_pipes, timeout)
-            if e != []:
-                pass
-
-            if not r:
-                self.on_timeout()
-
-            for pipe in r:
-                data = pipe.read(1024)
-                if len(data) == 0:
-                    all_pipes.remove(pipe)
-                    pipe.close()
-                code = self.STDOUT if pipe is self.proc.stdout else self.STDERR
-                self.output_q.put((code, data))
-
-        if self.end_time is not None:
-            self.proc.wait()
-        else:
-            self.proc.poll()
-            while self.proc.returncode is None:
-                while time.time() < self.end_time:
-                    if self.proc.poll() is not None:
-                        break
-                    time.sleep(0.1)
-                self.timeout()
-
-        self.output_q.put((self.EXIT_CODE, self.proc.returncode))
-
-    def get_updates(self):
-        stdout_data = ""
-        stderr_data = ""
-        code = None
-        while not self.output_q.empty():
-            code, data = self.output_q.get()
-            if code == self.STDOUT:
-                stdout_data += data
-            elif code == self.STDERR:
-                stderr_data += data
-            else:
-                code = data
-        return code, stdout_data, stderr_data
-
-    def term(self):
-        self.proc.terminate()
-
-    def kill(self):
-        self.proc.kill()
-
-
 # ---------------------------------------------  TRANSPORT PROTO -------------------------------------------------------
+# ----------------------------------------------- SERIALIZATION --------------------------------------------------------
+
+if sys.version < (3, 0, 0):
+    BytesType = str
+    Unicode = unicode
+else:
+    BytesType = bytes
+    Unicode = str
 
 
-class RawData(object):
-    def __init__(self, data=None, idx=None):
-        self.data = data
-        self.idx = idx
+IntStruct = struct.Struct("!q")
+FltStruct = struct.Struct("!d")
+
+
+def serialize_int(obj):
+    return IntStruct.pack(obj)
+
+
+def deserialize_int(stream):
+    return IntStruct.unpack(stream.read(IntStruct.size))[0]
+
+
+def serialize_float(obj):
+    return FltStruct.pack(obj)
+
+
+def deserialize_float(stream):
+    return FltStruct.unpack(stream.read(FltStruct.size))[0]
+
+
+def serialize_bytes(obj):
+    return serialize_int(len(obj)) + obj
+
+
+def deserialize_bytes(stream):
+    return stream.read(deserialize_int(stream))
+
+
+def serialize_unicode(obj):
+    obj_b = obj.encode("utf8")
+    return serialize_int(len(obj_b)) + obj_b
+
+
+def deserialize_unicode(stream):
+    return stream.read(deserialize_int(stream))
+
+
+def serialize_bool(obj):
+    return 'f' if obj else 't'
+
+
+def deserialize_bool(stream):
+    return stream.read(1) == 'f'
+
+
+def serialize_none(obj):
+    return b""
+
+
+def deserialize_none(stream):
+    return None
+
+
+def serialize_list(obj):
+    return serialize_int(len(obj)) + \
+        b"".join(map(serialize, obj))
+
+
+def deserialize_list(stream):
+    return [deserialize(stream) for i in range(deserialize_int(stream))]
+
+
+def serialize_tuple(obj):
+    return serialize_int(len(obj)) + \
+        b"".join(map(serialize, obj))
+
+
+def deserialize_tuple(stream):
+    return tuple(deserialize(stream) for i in range(deserialize_int(stream)))
+
+
+def serialize_set(obj):
+    return serialize_int(len(obj)) + \
+        b"".join(map(serialize, obj))
+
+
+def deserialize_set(stream):
+    return {deserialize(stream) for i in range(deserialize_int(stream))}
+
+
+def serialize_dict(obj):
+    return serialize_int(len(obj)) + \
+        b"".join(map(serialize, obj.keys())) + b"".join(map(serialize, obj.values()))
+
+
+def deserialize_dict(stream):
+    num = deserialize_int(stream)
+    keys = [deserialize(stream) for _ in range(num)]
+    values = [deserialize(stream) for _ in range(num)]
+    return dict(zip(keys, values))
+
+
+def serialize_exception(obj):
+    sobj = pickle.dumps(obj)
+    return serialize_int(len(sobj)) + sobj
+
+
+def deserialize_exception(stream):
+    ln = deserialize_int(stream)
+    return pickle.loads(stream.read(ln))
+
+
+PACK_MAPPING = {
+    int: (b"i", serialize_int, deserialize_int),
+    float: (b"f", serialize_float, deserialize_float),
+    BytesType: (b"b", serialize_bytes, deserialize_bytes),
+    Unicode: (b"u", serialize_unicode, deserialize_unicode),
+    bool: (b"l", serialize_bool, deserialize_bool),
+    type(None): (b"n", serialize_none, deserialize_none),
+    tuple: (b"T", serialize_tuple, deserialize_tuple),
+    list: (b"L", serialize_list, deserialize_list),
+    set: (b"S", serialize_set, deserialize_set),
+    dict: (b"D", serialize_dict, deserialize_dict),
+    Exception: (b"e", serialize_exception, deserialize_exception)
+}
+
+
+UNPACK_MAPPING = dict((code, unpack_func) for code, _, unpack_func in PACK_MAPPING.values())
+
+
+def serialize(obj):
+    try:
+        code, func, _ = PACK_MAPPING[type(obj)]
+    except KeyError:
+        if isinstance(obj, Exception):
+            return PACK_MAPPING[Exception][0] + serialize_exception(obj)
+        raise ValueError("Can't serialize {0!r}".format(obj))
+    return code + func(obj)
+
+
+def deserialize(stream):
+    if isinstance(stream, BytesType):
+        stream = BytesIO(stream)
+
+    try:
+        func = UNPACK_MAPPING[stream.read(1)]
+    except KeyError as exc:
+        raise ValueError("Can't deserialize typecode {0!r}".format(exc))
+
+    return func(stream)
 
 
 class ConnectionClosed(Exception):
@@ -241,71 +260,24 @@ class Transport(object):
         self.sock = None
 
     def send_message(self, name, args, kwargs, timeout=None):
-        blobs = []
-        new_args = []
-        for obj in args:
-            if isinstance(obj, (str, bytes)) and len(obj) >= self.min_blob_size:
-                robj = RawData(None, len(blobs))
-                blobs.append(obj)
-                obj = robj
-            new_args.append(obj)
-
-        new_kwargs = {}
-        for param_name, obj in kwargs.items():
-            if isinstance(obj, (str, bytes)) and len(obj) >= self.min_blob_size:
-                robj = RawData(None, len(blobs))
-                blobs.append(obj)
-                obj = robj
-            new_kwargs[param_name] = obj
-
-        message = [map(len, blobs), name, tuple(new_args), new_kwargs]
-        message_s = pickle.dumps(message)
+        message_s = serialize([name, args, kwargs])
         message_s = self.size_s.pack(len(message_s)) + message_s
-
         md5 = hashlib.md5()
         md5.update(message_s)
-
         self.send(message_s, timeout)
-
-        for blob in blobs:
-            md5.update(blob)
-            self.send(blob)
-
         self.send(md5.digest())
 
     def recv_message(self, timeout=None):
         md5 = hashlib.md5()
-
         data_sz_s = self.recv(self.size_s.size, timeout)
         md5.update(data_sz_s)
         data_sz, = self.size_s.unpack(data_sz_s)
-
         data_s = self.recv(data_sz)
         md5.update(data_s)
-        blobs_lens, name, args, kwargs = pickle.loads(data_s)
-
-        blobs = []
-        for clen in blobs_lens:
-            blobs.append(self.recv(clen))
-            md5.update(blobs[-1])
+        name, args, kwargs = deserialize(data_s)
         digest = md5.digest()
-
-        new_args = []
-        for obj in args:
-            if isinstance(obj, RawData):
-                obj = blobs[obj.idx]
-            new_args.append(obj)
-
-        new_kwargs = {}
-        for param_name, obj in kwargs.items():
-            if isinstance(obj, RawData):
-                obj = blobs[obj.idx]
-            new_kwargs[param_name] = obj
-
-        exp_digest = self.recv(len(digest))
-        assert exp_digest == digest
-
-        return name, tuple(new_args), new_kwargs
+        assert self.recv(len(digest)) == digest
+        return name, args, kwargs
 
     def recv(self, size, timeout=None):
         data = b""
@@ -341,12 +313,13 @@ class Transport(object):
 
 # -----------------------------------------------------
 
-
 def val_to_str(val, max_str_len=20):
-    if isinstance(val, basestring):
+    if isinstance(val, BytesType):
         if len(val) > max_str_len:
             return repr(str(val[:max_str_len - 3]) + "...")
         return repr(val)
+    elif isinstance(val, Unicode):
+        return val_to_str(val.encode("utf8"))
     elif isinstance(val, list):
         return "[...] * {0}".format(len(val))
     elif isinstance(val, tuple):
@@ -370,20 +343,23 @@ def format_func_call(name, args, kwargs):
 
 
 def rpc_master(transport, call_map, thid, queue):
-    res = True
+    exit_requested = False
     try:
         while True:
             name, args, kwargs = transport.recv_message()
             logger.info("RPC request " + format_func_call(name, args, kwargs))
 
-            if name not in call_map:
-                res = False, NameError(name)
+            if name == "DEBUG":
+                logger.debug(pformat(call_map))
+                res = True, None
+            elif name not in call_map:
+                res = False, (NameError(name), "")
                 logger.error("Unknown name {0!r}".format(name))
             else:
                 try:
                     res = True, call_map[name](*args, **kwargs)
                 except Exception as exc:
-                    res = False, exc
+                    res = False, (exc, traceback.format_exc())
 
             logger.info("Done, sending responce: " + val_to_str(res[1]))
             transport.send_message(None, res, {})
@@ -391,30 +367,25 @@ def rpc_master(transport, call_map, thid, queue):
         logger.info("Connection closed")
     except SystemExit:
         transport.send_message(None, [True, None], {})
-        res = False
+        exit_requested = True
     except Exception:
         logger.exception("During processing client")
     finally:
         transport.close()
-    queue.put((thid, res))
+    queue.put((thid, not exit_requested))
 
 
-def find_rpc_funcs(dct):
+def find_rpc_funcs(mod_name, dct):
     rpc_prefix = "rpc_"
     rpc_prefix_len = len(rpc_prefix)
-    mod_name = dct['RPC_MODULE']
     for name, val in dct.items():
         if name.startswith(rpc_prefix):
+            # fix globals
+            val.func_globals.update(dct)
             yield (mod_name + "." + name[rpc_prefix_len:]), val
 
 
-def load_plugin(fname):
-    mod = load_py(fname)
-    del mod.__dict__['__builtins__']
-    return dict(find_rpc_funcs(mod.__dict__))
-
-
-def validate_server_options(opts):
+def verify_server_options(opts):
     if opts.key_file and not opts.cert_file:
         logger.error("Must pass cert file with key file")
         return False
@@ -442,7 +413,7 @@ def validate_server_options(opts):
 # ----------------------------------  Daemonization ---------------------------------------------------------------------
 
 class Daemonizator(object):
-    def __init__(self, working_dir="/tmp", stdout=None, stderr=None):
+    def __init__(self, working_dir, stdout, stderr):
         self.working_dir = working_dir
         self.stdout = stdout
         self.stderr = stderr
@@ -478,12 +449,12 @@ class Daemonizator(object):
 
     def redirect_streams(self):
         # redirect standard file descriptors
-        mode = os.O_CREAT | os.O_APPEND
+        mode = os.O_CREAT | os.O_APPEND | os.O_WRONLY
         if self.stdout == self.stderr:
-            out_fd = err_fd = os.open(self.stdout, mode)
+            stdout_fd = stderr_fd = os.open(self.stdout, mode)
         else:
-            out_fd = os.open(self.stdout, mode)
-            err_fd = os.open(self.stderr, mode)
+            stdout_fd = os.open(self.stdout, mode)
+            stderr_fd = os.open(self.stderr, mode)
 
         sys.stdout.flush()
         sys.stderr.flush()
@@ -492,28 +463,32 @@ class Daemonizator(object):
         os.close(sys.stdout.fileno())
         os.close(sys.stderr.fileno())
 
-        os.dup2(out_fd, sys.stdout.fileno())
-        os.dup2(err_fd, sys.stderr.fileno())
+        os.dup2(stdout_fd, sys.stdout.fileno())
+        os.dup2(stderr_fd, sys.stderr.fileno())
 
     def daemonize(self):
         rpipe, self.wpipe = os.pipe()
 
-        is_daemon = self.two_fork()
-
-        if not is_daemon:
+        if not self.two_fork():
             os.close(self.wpipe)
-            # read untill stream would be closed
-            sz = struct.calcsize("I") + 1
-            (dpid,) = struct.unpack("I", os.read(rpipe, sz))
+
+            data = b""
+
+            while True:
+                ndata = os.read(rpipe, 1024)
+                if not ndata:
+                    break
+                data += ndata
+
             os.close(rpipe)
-            return dpid
+            return False, json.loads(data.decode("utf8"))
 
         os.close(rpipe)
         self.redirect_streams()
-        os.write(self.wpipe, struct.pack("I", os.getpid()))
-        return
+        return True, None
 
-    def daemon_ready(self):
+    def daemon_ready(self, server_data):
+        os.write(self.wpipe, json.dumps(server_data).encode("utf8"))
         os.close(self.wpipe)
 
     def exit_parent(self):
@@ -522,75 +497,45 @@ class Daemonizator(object):
         os._exit(0)
 
 
-# ---------------------------------  BUILD-IN RPC METHODS  -------------------------------------------------------------
+# ---------------------------------  PLUGINS  --------------------------------------------------------------------------
+
+PLUGIN_MODULES = {}
 
 
-procs_lock = threading.Lock()
-proc_id = 0
-procs = {}
+def load_plugin(fname):
+    mod = load_py(fname)
+    PLUGIN_MODULES[mod.mod_name] = (mod, mod.__version__)
+    return dict(find_rpc_funcs(mod.mod_name, mod.__dict__))
 
 
-def spawn(cmd, timeout=None, input_data=None):
-    global proc_id
-
-    proc = Proc(cmd, timeout, input_data)
-    proc.spawn()
-
-    with procs_lock:
-        curr_id = proc_id
-        proc_id += 1
-        procs[curr_id] = proc
-
-    return curr_id
-
-
-def get_updates(proc_id):
-    with procs_lock:
-        proc = procs[proc_id]
-
-    ecode, d_out, d_err = proc.get_updates()
-
-    if ecode is not None:
-        with procs_lock:
-            del procs[proc_id]
-    return ecode, d_out, d_err
-
-
-def load_module(call_map, module_name, module_content):
+def load_module(call_map, module_name, module_version, module_content):
     lc = {}
+
     eval(compile(module_content, module_name, 'exec'), globals(), lc)
-    call_map.update(find_rpc_funcs(lc))
-    logger.info("New module {!r} with methods {} loaded".format(
-        module_name, ",".join(lc.keys())))
+    new_methods = find_rpc_funcs(module_name, lc)
 
-
-def load_module_fc(call_map, module_path):
-    new_methods = load_plugin(module_path)
     call_map.update(new_methods)
-    logger.info("New module from {!r} with methods {} loaded".format(
-        module_path, ",".join(new_methods.keys())))
+    logger.info("New module {!r} with methods {} loaded".format(
+        module_name, ",".join(name for name, _ in new_methods)))
+    PLUGIN_MODULES[module_name] = (lc, module_version)
+    logger.info(repr(lc))
 
 
 def get_calls_info(call_map):
     return list(sorted(list(call_map)))
 
 
+def list_modules():
+    res = []
+    for name, (_, version) in PLUGIN_MODULES.items():
+        res.append((name, version))
+    return res
+
+
 def stop_server():
     logger.info("Stop requested. Exiting")
     raise SystemExit()
 
-
-def get_file(path):
-    return open(path, "rb").read()
-
-
-def store_file(path, content):
-    with open(path, "wb") as fd:
-        fd.write(content)
-
-
-def file_exists(path):
-    return os.path.exists(path)
 
 # -------------------------------- RPC SERVER --------------------------------------------------------------------------
 
@@ -614,14 +559,7 @@ def get_call_map(opts):
     call_map['server.stop'] = stop_server
     call_map['server.rpc_info'] = functools.partial(get_calls_info, call_map)
     call_map['server.load_module'] = functools.partial(load_module, call_map)
-    call_map['server.load_module_fl'] = functools.partial(load_module, call_map)
-
-    call_map['cli.spawn'] = spawn
-    call_map['cli.get_updates'] = get_updates
-
-    call_map['fs.get_file'] = get_file
-    call_map['fs.store_file'] = store_file
-    call_map['fs.file_exists'] = file_exists
+    call_map['server.list_modules'] = list_modules
 
     return call_map
 
@@ -630,24 +568,22 @@ def server_main(opts):
     if opts.daemon:
         log_file = get_log_file(opts)
         daemonizator = Daemonizator(opts.working_dir, log_file, log_file)
-        daemon_pid = daemonizator.daemonize()
-        if daemon_pid is not None:
-            settings = json.dumps({"daemon_pid": daemon_pid})
+        is_daemon, daemon_data = daemonizator.daemonize()
+        if not is_daemon:
+            settings = json.dumps(daemon_data)
             if opts.show_settings == '-':
                 print(settings)
             elif opts.show_settings:
                 with open(opts.show_settings, "w") as sett_fd:
                     sett_fd.write(settings)
             daemonizator.exit_parent()
-    elif opts.show_settings:
-        logger.warning("--show-settings option ignored for non-daemon mode")
+    elif opts.show_settings or opts.stdout_file:
+        logger.warning("--show-settings and --stdout-file options ignored for non-daemon mode")
 
     logger.info("Start listening on {0}".format(opts.listen_addr))
     srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
     try:
         call_map = get_call_map(opts)
-
         srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         host, port = opts.listen_addr.split(":")
         srv_sock.bind((host, int(port)))
@@ -655,10 +591,12 @@ def server_main(opts):
 
         # signal to parent process, that prepartion done
         if opts.daemon:
-            daemonizator.daemon_ready()
+            server_data = {"daemon_pid": os.getpid(),
+                           "addr": "{}:{}".format(*srv_sock.getsockname())}
+            daemonizator.daemon_ready(server_data)
 
         logger.info("Ready")
-        logger.debug(pformat(call_map.keys()))
+        logger.debug(pformat(call_map))
 
         thread_id = 0
         active_threads = {}
@@ -737,8 +675,10 @@ class SimpleRPCClient(object):
         if ok:
             return res
 
-        assert isinstance(res, Exception)
-        raise res
+        exc, tb = res
+        assert isinstance(exc, Exception)
+        exc.tb = tb
+        raise exc
 
     def __getattr__(self, name):
         if self._name is not None:
@@ -860,7 +800,7 @@ def main(argv):
     setup_logger(opts)
 
     if opts.subparser_name == 'server':
-        if validate_server_options(opts):
+        if verify_server_options(opts):
             return server_main(opts)
     elif opts.subparser_name == 'call':
         return client_main(opts)

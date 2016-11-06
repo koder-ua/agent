@@ -1,24 +1,23 @@
 import os
+import sys
 import time
 import json
 import signal
 import socket
-import shutil
 import pickle
-import tempfile
 import threading
 import contextlib
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-try:
+if sys.version < (3, 0, 0):
     import Queue as queue
-except ImportError:
+else:
     import queue
 
 import pytest
 
-from agent import agent
+from agent import agent, fs_plugin, cli_plugin
 
 import plugin1
 import plugin2
@@ -132,55 +131,66 @@ DEFAULT_BIND_ADDR = 'localhost:6677'
 
 @contextlib.contextmanager
 def spawn_server(**params):
-    with tempfile.NamedTemporaryFile(prefix="agent_test.") as fileobj:
-        log_name = fileobj.name
+    log_name = "/tmp/last.log"
 
-        default_params = {
-            'listen-addr': DEFAULT_BIND_ADDR,
-            'daemon': None,
-            'stdout-file': log_name,
-            'show-settings': None
-        }
+    default_params = {
+        'listen-addr': DEFAULT_BIND_ADDR,
+        'daemon': None,
+        'stdout-file': log_name,
+        'show-settings': None
+    }
 
-        if agent.__file__.endswith(".pyc"):
-            agent_path = agent.__file__[:-1]
+    if agent.__file__.endswith(".pyc"):
+        agent_path = agent.__file__[:-1]
+    else:
+        agent_path = agent.__file__
+
+    default_params.update(params)
+
+    cli_params = " ".join(
+        ("'--" + k.replace("_", '-') + ("=" + v if v else "") + "'")
+        for k, v in default_params.items()
+    )
+
+    agent_cmd = "python {} server {}".format(agent_path, cli_params)
+    jsettings = subprocess.check_output(agent_cmd, shell=True)
+    asett = json.loads(jsettings)
+
+    try:
+        addr = default_params['listen-addr'].split(":")
+        rpc = agent.connect(addr,
+                            default_params.get('key-file'),
+                            default_params.get('cert-file'),
+                            timeout=1)
+    except Exception:
+        os.kill(asett['daemon_pid'], signal.SIGKILL)
+        print(open(log_name).read())
+        raise
+
+    def get_mod_content(mod):
+        if mod.__file__.endswith(".pyc"):
+            return open(mod.__file__[:-1]).read()
         else:
-            agent_path = agent.__file__
+            return open(mod.__file__).read()
 
-        default_params.update(params)
-
-        cli_params = " ".join(
-            ("'--" + k.replace("_", '-') + ("=" + v if v else "") + "'")
-            for k, v in default_params.items()
-        )
-
-        agent_cmd = "python {} server {}".format(agent_path, cli_params)
-        jsettings = subprocess.check_output(agent_cmd, shell=True)
-        asett = json.loads(jsettings)
-
+    with rpc:
         try:
-            addr = default_params['listen-addr'].split(":")
-            rpc = agent.connect(addr,
-                                default_params.get('key-file'),
-                                default_params.get('cert-file'),
-                                timeout=1)
-        except Exception:
-            os.kill(asett['daemon_pid'], signal.SIGKILL)
-            print(open(log_name).read())
-            raise
-
-        try:
-            with rpc:
-                try:
-                    yield rpc
-                finally:
-                    try:
-                        rpc.server.stop()
-                    except Exception as exc:
-                        print("Failed to stop server: {!s}".format(exc))
+            rpc.server.load_module(fs_plugin.mod_name,
+                                   fs_plugin.__version__,
+                                   get_mod_content(fs_plugin))
+            rpc.server.load_module(cli_plugin.mod_name,
+                                   cli_plugin.__version__,
+                                   get_mod_content(cli_plugin))
+            yield rpc
         finally:
-            print(open(log_name).read())
-            shutil.copyfile(log_name, "/tmp/last.log")
+            try:
+                rpc.server.stop()
+            except Exception as exc:
+                rpc = agent.connect(addr,
+                                    default_params.get('key-file'),
+                                    default_params.get('cert-file'),
+                                    timeout=1)
+                rpc.server.stop()
 
 # ------------------    TESTS    ---------------------------------------------
 
@@ -298,8 +308,12 @@ def check_ls_in_folder(rpc, folder):
 
 
 def test_real_server_simple():
-    expected_methods = {'cli.spawn', 'cli.get_updates',
-                        'server.rpc_info', 'server.stop'}
+    expected_methods = {'server.load_module',
+                        'server.list_modules',
+                        'server.rpc_info',
+                        'server.stop',
+                        'cli.spawn',
+                        'cli.get_updates'}
     with spawn_server() as rpc:
         procs = rpc.server.rpc_info()
         assert expected_methods.issubset(set(procs))
@@ -392,3 +406,29 @@ def test_real_server_timeout():
     with spawn_server(plugin=plugin_path) as rpc:
         with pytest.raises(socket.timeout):
             rpc.pl2.timeout(10, _recv_timeout=1)
+
+
+def test_real_server_adhoc_plugin():
+    plugin_code = open(plugin1.__file__.replace(".pyc", ".py")).read()
+    with spawn_server() as rpc:
+        rpc.server.load_module(plugin1.mod_name, plugin1.__version__, plugin_code)
+        assert rpc.pl1.add(1, 2) == 3
+
+
+def test_serialization():
+    vals = (1, -1, 1243141,
+            1.4,
+            "asasa",
+            u"asdasd",
+            True, False,
+            None,
+            [1],
+            [1, "2", {333, 4}],
+            {1, 3},
+            (1, 2, 3),
+            {1: 2, "3": True})
+
+    for val in vals:
+        assert isinstance(agent.serialize(val), agent.BytesType)
+        assert agent.deserialize(agent.serialize(val)) == val
+

@@ -1,4 +1,5 @@
-RPC_MODULE = "pl1"
+mod_name = "pl1"
+__version__ = (1, 0)
 
 
 def rpc_add(x, y):
