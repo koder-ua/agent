@@ -1,59 +1,8 @@
-#!/usr/bin/env python2
-from __future__ import print_function
-
-import re
-import os
-
-try:
-    import ssl
-except ImportError:
-    ssl = None
-
-import sys
-import json
-import time
-import pickle
-import select
-import socket
-import struct
-import hashlib
-import logging
-import tempfile
-import argparse
-import traceback
-import functools
-import threading
-import subprocess
-from pprint import pprint, pformat
-
-if sys.version < (3, 0, 0):
-    import Queue as queue
-    from StringIO import StringIO as BytesIO
-else:
-    import queue
-    from io import BytesIO
-
-# ----------------------------- LOGGING --------------------------------------------------------------------------------
-
-logger = logging.getLogger('agent')
+from typing import Any
 
 
-def setup_logger(opts):
-    if opts.log_config:
-        if sys.version > (3, 0, 0):
-            logging.config.fileConfig(opts.log_config)
-        else:
-            raise ValueError("Python 2.X doesn't support logger config")
-    else:
-        level = getattr(logging, opts.log_level)
-        logger.setLevel(level)
-        ch = logging.StreamHandler()
-        ch.setLevel(level)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        ch.setFormatter(formatter)
-        logger.addHandler(ch)
-
-# ----------------------------- LOAD PLUGINS ---------------------------------------------------------------------------
+def setup_logger(opts: Any) -> None:
+    ...
 
 
 RPC_TEMPO_MOD = "__rpc_temporary_module__"

@@ -16,4 +16,3 @@ def rpc_store_file(path, content):
 
 def rpc_file_exists(path):
     return os.path.exists(path)
-
