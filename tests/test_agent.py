@@ -10,7 +10,7 @@ import contextlib
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-if sys.version < (3, 0, 0):
+if sys.version_info < (3, 0, 0):
     import Queue as queue
 else:
     import queue
@@ -185,7 +185,7 @@ def spawn_server(**params):
         finally:
             try:
                 rpc.server.stop()
-            except Exception as exc:
+            except Exception:
                 rpc = agent.connect(addr,
                                     default_params.get('key-file'),
                                     default_params.get('cert-file'),
@@ -431,4 +431,3 @@ def test_serialization():
     for val in vals:
         assert isinstance(agent.serialize(val), agent.BytesType)
         assert agent.deserialize(agent.serialize(val)) == val
-

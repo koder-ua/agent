@@ -26,12 +26,13 @@ import threading
 import subprocess
 from pprint import pprint, pformat
 
-if sys.version < (3, 0, 0):
+if sys.version_info < (3, 0, 0):
     import Queue as queue
     from StringIO import StringIO as BytesIO
 else:
     import queue
     from io import BytesIO
+
 
 # ----------------------------- LOGGING --------------------------------------------------------------------------------
 
@@ -40,7 +41,7 @@ logger = logging.getLogger('agent')
 
 def setup_logger(opts):
     if opts.log_config:
-        if sys.version > (3, 0, 0):
+        if sys.version_info > (3, 0, 0):
             logging.config.fileConfig(opts.log_config)
         else:
             raise ValueError("Python 2.X doesn't support logger config")
@@ -88,7 +89,7 @@ else:
 # ---------------------------------------------  TRANSPORT PROTO -------------------------------------------------------
 # ----------------------------------------------- SERIALIZATION --------------------------------------------------------
 
-if sys.version < (3, 0, 0):
+if sys.version_info < (3, 0, 0):
     BytesType = str
     Unicode = unicode
 else:
@@ -130,15 +131,15 @@ def serialize_unicode(obj):
 
 
 def deserialize_unicode(stream):
-    return stream.read(deserialize_int(stream))
+    return stream.read(deserialize_int(stream)).decode("utf8")
 
 
 def serialize_bool(obj):
-    return 'f' if obj else 't'
+    return b't' if obj else b'f'
 
 
 def deserialize_bool(stream):
-    return stream.read(1) == 'f'
+    return stream.read(1) == b't'
 
 
 def serialize_none(obj):
@@ -173,7 +174,7 @@ def serialize_set(obj):
 
 
 def deserialize_set(stream):
-    return {deserialize(stream) for i in range(deserialize_int(stream))}
+    return set(deserialize(stream) for i in range(deserialize_int(stream)))
 
 
 def serialize_dict(obj):
@@ -223,6 +224,7 @@ def serialize(obj):
         if isinstance(obj, Exception):
             return PACK_MAPPING[Exception][0] + serialize_exception(obj)
         raise ValueError("Can't serialize {0!r}".format(obj))
+    # print(repr(code), repr(func(obj)))
     return code + func(obj)
 
 
@@ -241,6 +243,8 @@ def deserialize(stream):
 class ConnectionClosed(Exception):
     pass
 
+
+# TODO: reconnect on error
 
 class Transport(object):
     TIMEOUT = 30
@@ -269,7 +273,15 @@ class Transport(object):
 
     def recv_message(self, timeout=None):
         md5 = hashlib.md5()
-        data_sz_s = self.recv(self.size_s.size, timeout)
+
+        while True:
+            try:
+                data_sz_s = self.recv(self.size_s.size, timeout)
+                break
+            except socket.timeout:
+                if timeout is not None:
+                    raise
+
         md5.update(data_sz_s)
         data_sz, = self.size_s.unpack(data_sz_s)
         data_s = self.recv(data_sz)
@@ -281,16 +293,24 @@ class Transport(object):
 
     def recv(self, size, timeout=None):
         data = b""
-
         if timeout:
-            r, _, _ = select.select([self.sock], [], [], timeout)
-            if not r:
-                raise socket.timeout("Recv start timeout")
+            etime = time.time() + timeout
+        else:
+            etime = None
 
         while size != len(data):
+            if etime:
+                wtime = etime - time.time()
+                if wtime < 0:
+                    raise socket.timeout("Receive timeout")
+                r, _, _ = select.select([self.sock], [], [], wtime)
+                if not r:
+                    raise socket.timeout("Receive timeout")
+
             ndata = self.sock.recv(size - len(data))
             if not ndata:
-                raise ConnectionClosed()
+                raise ConnectionClosed(str(self.sock.getpeername()))
+
             data += ndata
 
         return data
@@ -301,9 +321,13 @@ class Transport(object):
             return
 
         etime = time.time() + timeout
-        while True:
+        while data:
             tleft = etime - time.time()
+            if tleft < 0:
+                raise socket.timeout("Send timeout")
+
             _, w, _ = select.select([], [self.sock], [], tleft)
+
             if not w:
                 raise socket.timeout("Send timeout")
 
@@ -311,7 +335,62 @@ class Transport(object):
             data = data[send_bytes:]
 
 
-# -----------------------------------------------------
+# ----------------------------------  Thread pool ----------------------------------------------------------------------
+
+
+def worker(iq, oq):
+    while True:
+        id, func, arg = iq.get()
+
+        if id is None:
+            return
+
+        try:
+            oq.put((id, True, func(arg)))
+        except Exception as exc:
+            oq.put((id, False, exc))
+
+
+class Pool(object):
+    def __init__(self, size=32):
+        self.tasks_q = queue.Queue()
+        self.results_q = queue.Queue()
+        self.threads = [threading.Thread(target=worker, args=(self.tasks_q, self.results_q))]
+
+        for th in self.threads:
+            th.daemon = True
+            th.start()
+
+    def map(self, func, vals):
+        for pos, val in enumerate(vals):
+            self.tasks_q.put((pos, func, val))
+
+        res = []
+        while len(res) < len(vals):
+            res.append(self.results_q.get())
+
+        res.sort()
+        return [(ok, val) for _, ok, val in res]
+
+    def stop(self):
+        for th in self.threads:
+            self.tasks_q.put((None, None, None))
+
+        for th in self.threads:
+            th.join()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, x, y, z):
+        self.stop()
+
+
+sys.modules['Pool'] = Pool
+
+
+# ----------------------------------  Utils ----------------------------------------------------------------------------
+
 
 def val_to_str(val, max_str_len=20):
     if isinstance(val, BytesType):
@@ -347,21 +426,22 @@ def rpc_master(transport, call_map, thread_id, rpc_queue):
     try:
         while True:
             name, args, kwargs = transport.recv_message()
-            logger.info("RPC request " + format_func_call(name, args, kwargs))
+            logger.debug("RPC request " + format_func_call(name, args, kwargs))
 
             if name == "DEBUG":
                 logger.debug(pformat(call_map))
                 res = True, None
             elif name not in call_map:
-                res = False, (NameError(name), "")
+                res = False, ("Name {} is not found in RPC map".format(name), "")
                 logger.error("Unknown name {0!r}".format(name))
             else:
                 try:
                     res = True, call_map[name](*args, **kwargs)
                 except Exception as exc:
-                    res = False, (exc, traceback.format_exc())
+                    logger.info("Client call failed: %s", exc)
+                    res = False, (str(exc), traceback.format_exc())
 
-            logger.info("Done, sending responce: " + val_to_str(res[1]))
+            logger.debug("Done, sending responce: " + val_to_str(res[1]))
             transport.send_message(None, res, {})
     except ConnectionClosed:
         logger.info("Connection closed")
@@ -410,7 +490,7 @@ def verify_server_options(opts):
     return True
 
 
-# ----------------------------------  Daemonization ---------------------------------------------------------------------
+# ----------------------------------  Daemonization --------------------------------------------------------------------
 
 
 class Daemonizator(object):
@@ -501,18 +581,23 @@ class Daemonizator(object):
 # ---------------------------------  PLUGINS  --------------------------------------------------------------------------
 
 PLUGIN_MODULES = {}
+MODULES = []
 
 
 def load_plugin(fname):
+    logger.info("Loading plugin from file %r", fname)
     mod = load_py(fname)
     PLUGIN_MODULES[mod.mod_name] = (mod, mod.__version__)
-    return dict(find_rpc_funcs(mod.mod_name, mod.__dict__))
+    methonds = dict(find_rpc_funcs(mod.mod_name, mod.__dict__))
+    logger.info("Module %s with methods %r loader", mod.mod_name, ",".join(methonds.keys()))
+    return methonds
 
 
 def load_module(call_map, module_name, module_version, module_content):
     lc = {}
+    logger.info("Loading plugin %r", module_name)
 
-    eval(compile(module_content, module_name, 'exec'), globals(), lc)
+    exec(compile(module_content, module_name, 'exec'), globals(), lc)
     new_methods = find_rpc_funcs(module_name, lc)
 
     call_map.update(new_methods)
@@ -522,8 +607,29 @@ def load_module(call_map, module_name, module_version, module_content):
     logger.info(repr(lc))
 
 
+def load_module_file(call_map, module_name, module_version, module_content):
+    lc = {}
+    logger.info("Loading plugin %r", module_name)
+
+    fd, path = tempfile.mkstemp()
+    os.write(fd, module_content)
+    os.close(fd)
+    mod = load_py(path)
+    os.unlink(path)
+
+    new_methods = find_rpc_funcs(module_name, mod.__dict__)
+    call_map.update(new_methods)
+
+    logger.info("New module {!r} with methods {} loaded".format(
+        module_name, ",".join(name for name, _ in new_methods)))
+
+    PLUGIN_MODULES[module_name] = (mod.__dict__, module_version)
+    MODULES.append(mod)
+    logger.info(repr(lc))
+
+
 def get_calls_info(call_map):
-    return list(sorted(list(call_map)))
+    return list(x.decode("utf8") for x in sorted(list(call_map)))
 
 
 def list_modules():
@@ -536,6 +642,17 @@ def list_modules():
 def stop_server():
     logger.info("Stop requested. Exiting")
     raise SystemExit()
+
+
+def flush_logs():
+    for handler in logger.handlers:
+        handler.flush()
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except:
+            pass
 
 
 # -------------------------------- RPC SERVER --------------------------------------------------------------------------
@@ -559,8 +676,9 @@ def get_call_map(opts):
 
     call_map['server.stop'] = stop_server
     call_map['server.rpc_info'] = functools.partial(get_calls_info, call_map)
-    call_map['server.load_module'] = functools.partial(load_module, call_map)
+    call_map['server.load_module'] = functools.partial(load_module_file, call_map)
     call_map['server.list_modules'] = list_modules
+    call_map['server.flush_logs'] = flush_logs
 
     return call_map
 
@@ -650,11 +768,17 @@ def server_main(opts):
 
 
 class SimpleRPCClient(object):
-    def __init__(self, transport, name=None):
+    def __init__(self, transport, name=None, lock=None):
         self._tr = transport
         self._name = name
+        if lock is None:
+            self._rpc_lock = threading.Lock()
+        else:
+            self._rpc_lock = lock
 
     def __call__(self, *args, **kwargs):
+        assert self._tr is not None, "Connection already closed"
+
         if self._name is None:
             raise ValueError("Can't call empty name")
 
@@ -668,30 +792,39 @@ class SimpleRPCClient(object):
         else:
             recv_timeout = None
 
-        self._tr.send_message(self._name, args, kwargs, timeout=send_timeout)
-        name, (ok, res), kwargs = self._tr.recv_message(timeout=recv_timeout)
+        with self._rpc_lock:
+            self._tr.send_message(self._name, args, kwargs, timeout=send_timeout)
+            name, (ok, res), kwargs = self._tr.recv_message(timeout=recv_timeout)
+
         assert name is None
         assert kwargs == {}
 
         if ok:
             return res
 
-        exc, tb = res
-        assert isinstance(exc, Exception)
-        exc.tb = tb
-        raise exc
+        exc_msg, tb = res
+        raise RuntimeError(exc_msg.decode("utf8") + "\nOriginal traceback:\n" + tb.decode("utf8"))
+
+    def disconnect(self):
+        assert self._tr is not None, "Connection already closed"
+
+        self._tr.close()
+        self._tr = None
 
     def __getattr__(self, name):
+        assert self._tr is not None, "Connection already closed"
+
         if self._name is not None:
             name = self._name + '.' + name
-        return self.__class__(self._tr, name)
+        return self.__class__(self._tr, name, lock=self._rpc_lock)
 
     def __enter__(self):
+        assert self._tr is not None, "Connection already closed"
+
         return self
 
     def __exit__(self, x, y, z):
-        self._tr.close()
-        self._tr = None
+        self.disconnect()
 
 
 def connect(addr, key_file=None, cert_file=None, conn_timeout=5, timeout=None):

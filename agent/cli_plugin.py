@@ -1,11 +1,14 @@
+from __future__ import print_function
+
 import sys
 import time
 import select
+import logging
 import tempfile
 import threading
 import subprocess
 
-if sys.version < (3, 0, 0):
+if sys.version_info < (3, 0, 0):
     import Queue as queue
 else:
     import queue
@@ -13,6 +16,9 @@ else:
 
 mod_name = "cli"
 __version__ = (1, 0)
+
+
+logger = logging.getLogger("agent.cli")
 
 
 class Proc(object):
@@ -80,6 +86,8 @@ class Proc(object):
             raise RuntimeError("Can't kill process")
 
     def watch_proc_th(self):
+        output_size = 0
+
         if self.merge_out:
             all_pipes = [self.proc.stdout]
         else:
@@ -105,6 +113,7 @@ class Proc(object):
                 if len(data) == 0:
                     all_pipes.remove(pipe)
                     pipe.close()
+                output_size += len(data)
                 code = self.STDOUT if pipe is self.proc.stdout else self.STDERR
                 self.output_q.put((code, data))
 
@@ -117,22 +126,28 @@ class Proc(object):
                     if self.proc.poll() is not None:
                         break
                     time.sleep(0.1)
-                self.timeout()
+                self.on_timeout()
 
         self.output_q.put((self.EXIT_CODE, self.proc.returncode))
+        logger.debug("Proc %r returns %s and provides %s bytes", self.cmd, self.proc.returncode, output_size)
 
     def get_updates(self):
         stdout_data = ""
         stderr_data = ""
         code = None
         while not self.output_q.empty():
-            code, data = self.output_q.get()
-            if code == self.STDOUT:
+            msg_code, data = self.output_q.get()
+            if msg_code == self.STDOUT:
+                assert code is None, "Data after exit_code"
                 stdout_data += data
-            elif code == self.STDERR:
+            elif msg_code == self.STDERR:
+                assert code is None, "Data after exit_code"
                 stderr_data += data
-            else:
+            elif msg_code == self.EXIT_CODE:
+                assert code is None, "Exit code after exit_code"
                 code = data
+            else:
+                assert False, "Unknown typecode {}".format(msg_code)
         return code, stdout_data, stderr_data
 
     def term(self):
@@ -147,10 +162,10 @@ proc_id = 0
 procs = {}
 
 
-def rpc_spawn(cmd, timeout=None, input_data=None):
+def rpc_spawn(cmd, timeout=None, input_data=None, merge_out=False):
     global proc_id
 
-    proc = Proc(cmd, timeout, input_data)
+    proc = Proc(cmd, timeout, input_data, merge_out=merge_out)
     proc.spawn()
 
     with procs_lock:
@@ -170,6 +185,6 @@ def rpc_get_updates(proc_id):
     if ecode is not None:
         with procs_lock:
             del procs[proc_id]
+
+    logger.debug("Send CLI update for id %s. code=%s, out_len=%s err_len=%s", proc_id, ecode, len(d_out), len(d_err))
     return ecode, d_out, d_err
-
-
