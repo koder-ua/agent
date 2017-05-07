@@ -30,9 +30,7 @@ class Settings(object):
 
 
 def spawn_rpc(transport, call_map):
-    th = threading.Thread(target=agent.rpc_master,
-                          args=(transport, call_map,
-                                0, queue.Queue()))
+    th = threading.Thread(target=agent.rpc_worker, args=(transport, call_map, 0, queue.Queue()))
     th.daemon = True
     th.start()
     return th
@@ -175,12 +173,8 @@ def spawn_server(**params):
 
     with rpc:
         try:
-            rpc.server.load_module(fs_plugin.mod_name,
-                                   fs_plugin.__version__,
-                                   get_mod_content(fs_plugin))
-            rpc.server.load_module(cli_plugin.mod_name,
-                                   cli_plugin.__version__,
-                                   get_mod_content(cli_plugin))
+            rpc.server.load_module(fs_plugin.mod_name, fs_plugin.__version__, get_mod_content(fs_plugin))
+            rpc.server.load_module(cli_plugin.mod_name, cli_plugin.__version__, get_mod_content(cli_plugin))
             yield rpc
         finally:
             try:

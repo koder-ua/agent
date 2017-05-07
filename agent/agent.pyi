@@ -1,3 +1,5 @@
+import sys
+import struct
 from typing import Any
 
 

@@ -1,17 +1,15 @@
 from __future__ import print_function
 
-import sys
 import time
 import select
+import signal
 import logging
 import tempfile
 import threading
 import subprocess
 
-if sys.version_info < (3, 0, 0):
-    import Queue as queue
-else:
-    import queue
+
+from agent_module import queue, noraise
 
 
 mod_name = "cli"
@@ -129,7 +127,7 @@ class Proc(object):
                 self.on_timeout()
 
         self.output_q.put((self.EXIT_CODE, self.proc.returncode))
-        logger.debug("Proc %r returns %s and provides %s bytes", self.cmd, self.proc.returncode, output_size)
+        logger.debug("Proc %r returns %s and provides %s bytes of output", self.cmd, self.proc.returncode, output_size)
 
     def get_updates(self):
         stdout_data = ""
@@ -147,14 +145,14 @@ class Proc(object):
                 assert code is None, "Exit code after exit_code"
                 code = data
             else:
-                assert False, "Unknown typecode {}".format(msg_code)
+                assert False, "Unknown typecode {0}".format(msg_code)
         return code, stdout_data, stderr_data
 
     def term(self):
         self.proc.terminate()
 
-    def kill(self):
-        self.proc.kill()
+    def kill(self, signal=signal.SIGKILL):
+        self.proc.send_signal(signal)
 
 
 procs_lock = threading.Lock()
@@ -162,9 +160,11 @@ proc_id = 0
 procs = {}
 
 
+@noraise
 def rpc_spawn(cmd, timeout=None, input_data=None, merge_out=False):
     global proc_id
 
+    logger.info("CMD start requested: %s", cmd)
     proc = Proc(cmd, timeout, input_data, merge_out=merge_out)
     proc.spawn()
 
@@ -176,6 +176,15 @@ def rpc_spawn(cmd, timeout=None, input_data=None, merge_out=False):
     return curr_id
 
 
+@noraise
+def rpc_kill(proc_id, signal=signal.SIGKILL):
+    with procs_lock:
+        proc = procs[proc_id]
+    logger.info("Signal %s is requested for %s", signal, proc.cmd)
+    proc.kill(signal)
+
+
+@noraise
 def rpc_get_updates(proc_id):
     with procs_lock:
         proc = procs[proc_id]
@@ -186,5 +195,4 @@ def rpc_get_updates(proc_id):
         with procs_lock:
             del procs[proc_id]
 
-    logger.debug("Send CLI update for id %s. code=%s, out_len=%s err_len=%s", proc_id, ecode, len(d_out), len(d_err))
     return ecode, d_out, d_err

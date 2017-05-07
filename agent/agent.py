@@ -26,13 +26,19 @@ import threading
 import subprocess
 from pprint import pprint, pformat
 
-if sys.version_info < (3, 0, 0):
-    import Queue as queue
-    from StringIO import StringIO as BytesIO
-else:
-    import queue
-    from io import BytesIO
 
+IS_PYTHON3 = (sys.version_info >= (3,))
+
+if IS_PYTHON3:
+    import queue
+    from io import BytesIO as BIO
+    BytesType = bytes
+    Unicode = str
+else:
+    import Queue as queue
+    from StringIO import StringIO as BIO
+    BytesType = str
+    Unicode = unicode
 
 # ----------------------------- LOGGING --------------------------------------------------------------------------------
 
@@ -41,7 +47,7 @@ logger = logging.getLogger('agent')
 
 def setup_logger(opts):
     if opts.log_config:
-        if sys.version_info > (3, 0, 0):
+        if IS_PYTHON3:
             logging.config.fileConfig(opts.log_config)
         else:
             raise ValueError("Python 2.X doesn't support logger config")
@@ -60,7 +66,7 @@ def setup_logger(opts):
 RPC_TEMPO_MOD = "__rpc_temporary_module__"
 
 
-if sys.version_info < (3, 0):
+if not IS_PYTHON3:
     import imp
 
     def load_py(path):
@@ -88,14 +94,6 @@ else:
 
 # ---------------------------------------------  TRANSPORT PROTO -------------------------------------------------------
 # ----------------------------------------------- SERIALIZATION --------------------------------------------------------
-
-if sys.version_info < (3, 0, 0):
-    BytesType = str
-    Unicode = unicode
-else:
-    BytesType = bytes
-    Unicode = str
-
 
 IntStruct = struct.Struct("!q")
 FltStruct = struct.Struct("!d")
@@ -151,8 +149,7 @@ def deserialize_none(stream):
 
 
 def serialize_list(obj):
-    return serialize_int(len(obj)) + \
-        b"".join(map(serialize, obj))
+    return serialize_int(len(obj)) + b"".join(map(serialize, obj))
 
 
 def deserialize_list(stream):
@@ -160,8 +157,7 @@ def deserialize_list(stream):
 
 
 def serialize_tuple(obj):
-    return serialize_int(len(obj)) + \
-        b"".join(map(serialize, obj))
+    return serialize_int(len(obj)) + b"".join(map(serialize, obj))
 
 
 def deserialize_tuple(stream):
@@ -178,8 +174,7 @@ def deserialize_set(stream):
 
 
 def serialize_dict(obj):
-    return serialize_int(len(obj)) + \
-        b"".join(map(serialize, obj.keys())) + b"".join(map(serialize, obj.values()))
+    return serialize_int(len(obj)) + b"".join(map(serialize, obj.keys())) + b"".join(map(serialize, obj.values()))
 
 
 def deserialize_dict(stream):
@@ -224,13 +219,12 @@ def serialize(obj):
         if isinstance(obj, Exception):
             return PACK_MAPPING[Exception][0] + serialize_exception(obj)
         raise ValueError("Can't serialize {0!r}".format(obj))
-    # print(repr(code), repr(func(obj)))
     return code + func(obj)
 
 
 def deserialize(stream):
     if isinstance(stream, BytesType):
-        stream = BytesIO(stream)
+        stream = BIO(stream)
 
     try:
         func = UNPACK_MAPPING[stream.read(1)]
@@ -253,10 +247,11 @@ class Transport(object):
 
     def __init__(self, sock, timeout=None):
         self.sock = sock
-        if timeout is None:
-            self.sock.settimeout(self.TIMEOUT)
-        else:
-            self.sock.settimeout(timeout)
+        self.sock.settimeout(self.TIMEOUT if timeout is None else timeout)
+
+    @property
+    def remote_addr(self):
+        return self.sock.getpeername()
 
     def close(self):
         self.sock.shutdown(socket.SHUT_RDWR)
@@ -293,10 +288,7 @@ class Transport(object):
 
     def recv(self, size, timeout=None):
         data = b""
-        if timeout:
-            etime = time.time() + timeout
-        else:
-            etime = None
+        etime = None if timeout is None else (time.time() + timeout)
 
         while size != len(data):
             if etime:
@@ -346,16 +338,20 @@ def worker(iq, oq):
             return
 
         try:
-            oq.put((id, True, func(arg)))
+            oq.put((id, func(arg), None, None))
         except Exception as exc:
-            oq.put((id, False, exc))
+            tb = traceback.format_exc()
+            if getattr(func, 'noraise', False):
+                logger.error("Exception during %s: %s.\n%s", func.__name__, exc, tb)
+            oq.put((id, exc, tb, type(exc).__name__))
 
 
 class Pool(object):
     def __init__(self, size=32):
         self.tasks_q = queue.Queue()
         self.results_q = queue.Queue()
-        self.threads = [threading.Thread(target=worker, args=(self.tasks_q, self.results_q))]
+        self.threads = [threading.Thread(target=worker, args=(self.tasks_q, self.results_q))
+                        for _ in range(size)]
 
         for th in self.threads:
             th.daemon = True
@@ -369,11 +365,10 @@ class Pool(object):
         while len(res) < len(vals):
             res.append(self.results_q.get())
 
-        res.sort()
-        return [(ok, val) for _, ok, val in res]
+        return [(val, tb, exc_cls_name) for _, val, tb, exc_cls_name in sorted(res)]
 
     def stop(self):
-        for th in self.threads:
+        for _ in self.threads:
             self.tasks_q.put((None, None, None))
 
         for th in self.threads:
@@ -386,7 +381,48 @@ class Pool(object):
         self.stop()
 
 
-sys.modules['Pool'] = Pool
+# ----------------------------------  agent_module ---------------------------------------------------------------------
+
+
+class Promote(Exception):
+    def __init__(self, msg, tb, cls_name):
+        Exception.__init__(self, msg)
+        self.tb = tb
+        self.cls_name = cls_name
+
+
+if IS_PYTHON3:
+    def tostr(vl):
+        if isinstance(vl, bytes):
+            return vl.decode('utf8', errors='replace')
+        return vl
+else:
+    def tostr(vl):
+        if isinstance(vl, unicode):
+            return vl.encode('utf8')
+        return vl
+
+
+def noraise(func):
+    func.noraise = True
+    return func
+
+
+class AgentModule:
+    pass
+
+
+agent_module = AgentModule()
+agent_module.Pool = Pool
+agent_module.noraise = noraise
+agent_module.queue = queue
+agent_module.BIO = BIO
+agent_module.tostr = tostr
+agent_module.IS_PYTHON3 = IS_PYTHON3
+agent_module.Promote = Promote
+
+
+sys.modules['agent_module'] = agent_module
 
 
 # ----------------------------------  Utils ----------------------------------------------------------------------------
@@ -394,11 +430,11 @@ sys.modules['Pool'] = Pool
 
 def val_to_str(val, max_str_len=20):
     if isinstance(val, BytesType):
-        if len(val) > max_str_len:
-            return repr(str(val[:max_str_len - 3]) + "...")
+        if len(val) > max_str_len - 2:
+            return repr(str(val[:max_str_len - 5]) + "...")
         return repr(val)
     elif isinstance(val, Unicode):
-        return val_to_str(val.encode("utf8"))
+        return val_to_str(val.encode("utf8"), max_str_len)
     elif isinstance(val, list):
         return "[...] * {0}".format(len(val))
     elif isinstance(val, tuple):
@@ -416,40 +452,46 @@ def val_to_str(val, max_str_len=20):
 
 def format_func_call(name, args, kwargs):
     params = list(map(val_to_str, args))
-    params += ["{0}={1}".format(var_name, val_to_str(val))
-               for var_name, val in sorted(kwargs.items())]
+    params += ["{0}={1}".format(var_name, val_to_str(val)) for var_name, val in sorted(kwargs.items())]
     return "{0}({1})".format(name, ", ".join(params))
 
 
-def rpc_master(transport, call_map, thread_id, rpc_queue):
+def rpc_worker(transport, call_map, thread_id, rpc_queue):
     exit_requested = False
     try:
         while True:
             name, args, kwargs = transport.recv_message()
-            logger.debug("RPC request " + format_func_call(name, args, kwargs))
 
             if name == "DEBUG":
-                logger.debug(pformat(call_map))
-                res = True, None
+                logger.info("DEBUG info requested: \n%s", pformat(call_map))
+                res = None, None, None
             elif name not in call_map:
-                res = False, ("Name {} is not found in RPC map".format(name), "")
-                logger.error("Unknown name {0!r}".format(name))
+                msg = "Name {0!r} is not found in RPC map".format(name)
+                res = msg, None, 'NameError'
+                logger.error(msg)
             else:
+                func = call_map[name]
+                fcall = format_func_call(name, args, kwargs)
                 try:
-                    res = True, call_map[name](*args, **kwargs)
+                    res = func(*args, **kwargs), None, None
+                except Promote as exc:
+                    res = exc.message, exc.tb, exc.cls_name
                 except Exception as exc:
-                    logger.info("Client call failed: %s", exc)
-                    res = False, (str(exc), traceback.format_exc())
+                    tb = traceback.format_exc()
+                    if getattr(func, 'noraise', False):
+                        logger.warning("Request %s failed: %s.\n%s", fcall, exc, tb)
+                    res = str(exc), tb, type(exc).__name__
+                else:
+                    logger.debug("%s => %s", fcall, val_to_str(res[0    ]))
 
-            logger.debug("Done, sending responce: " + val_to_str(res[1]))
             transport.send_message(None, res, {})
     except ConnectionClosed:
-        logger.info("Connection closed")
+        logger.info("Connection to client %s closed", transport.remote_addr)
     except SystemExit:
-        transport.send_message(None, [True, None], {})
+        transport.send_message(None, [None, None, None], {})
         exit_requested = True
     except Exception:
-        logger.exception("During processing client")
+        logger.exception("During processing data from %s", transport.remote_addr)
     finally:
         transport.close()
     rpc_queue.put((thread_id, not exit_requested))
@@ -471,20 +513,28 @@ def verify_server_options(opts):
         return False
 
     if not re.match(r".*:\d+", opts.listen_addr):
-        logger.error("Wrong listen addr")
+        logger.error("Wrong listen addr %r", opts.listen_addr)
         return False
 
-    host, port = opts.listen_addr.split(":")
-    port = int(port)
+    if ':' not in opts.listen_addr:
+        logger.error("Wrong host:port - %r", opts.listen_addr)
+        return False
 
-    if port > (2 ** 16 - 1):
-        logger.error("Wrong port")
+    host, port_s = opts.listen_addr.split(":")
+    try:
+        port = int(port_s)
+    except ValueError:
+        logger.error("port is not integer %r", port_s)
+        return False
+
+    if 0 > port or port >= 2 ** 16:
+        logger.error("Wrong port %s", port)
         return False
 
     try:
         socket.gethostbyname(host)
     except socket.gaierror:
-        logger.error("Can't resolve host in listen addr")
+        logger.error("Can't resolve host %r in listen addr", host)
         return False
 
     return True
@@ -507,7 +557,7 @@ class Daemonizator(object):
                 # return to parent
                 return False
         except OSError as e:
-            sys.stderr.write("fork #1 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.stderr.write("fork #1 failed: {0} ({1})\n".format(e.errno, e.strerror))
             sys.exit(1)
 
         # decouple from parent environment
@@ -521,7 +571,7 @@ class Daemonizator(object):
                 # use os._exit to aviod calling atexit functions
                 os._exit(0)
         except OSError as e:
-            sys.stderr.write("fork #2 failed: %d (%s)\n" % (e.errno, e.strerror))
+            sys.stderr.write("fork #2 failed: {0} ({1})\n".format(e.errno, e.strerror))
             sys.exit(1)
 
         os.chdir(self.working_dir)
@@ -589,7 +639,7 @@ def load_plugin(fname):
     mod = load_py(fname)
     PLUGIN_MODULES[mod.mod_name] = (mod, mod.__version__)
     methonds = dict(find_rpc_funcs(mod.mod_name, mod.__dict__))
-    logger.info("Module %s with methods %r loader", mod.mod_name, ",".join(methonds.keys()))
+    logger.info("Module %s with methods %s loader", mod.mod_name, ",".join(methonds.keys()))
     return methonds
 
 
@@ -601,8 +651,7 @@ def load_module(call_map, module_name, module_version, module_content):
     new_methods = find_rpc_funcs(module_name, lc)
 
     call_map.update(new_methods)
-    logger.info("New module {!r} with methods {} loaded".format(
-        module_name, ",".join(name for name, _ in new_methods)))
+    logger.info("New module %s with methods %s loaded", module_name, ",".join(name for name, _ in new_methods))
     PLUGIN_MODULES[module_name] = (lc, module_version)
     logger.info(repr(lc))
 
@@ -620,8 +669,7 @@ def load_module_file(call_map, module_name, module_version, module_content):
     new_methods = find_rpc_funcs(module_name, mod.__dict__)
     call_map.update(new_methods)
 
-    logger.info("New module {!r} with methods {} loaded".format(
-        module_name, ",".join(name for name, _ in new_methods)))
+    logger.info("New module %s with methods %s loaded", module_name, ",".join(name for name, _ in new_methods))
 
     PLUGIN_MODULES[module_name] = (mod.__dict__, module_version)
     MODULES.append(mod)
@@ -655,17 +703,25 @@ def flush_logs():
             pass
 
 
+LOG_FILE = None
+
+
+def get_logs():
+    if LOG_FILE:
+        return open(LOG_FILE).read()
+    return None
+
+
 # -------------------------------- RPC SERVER --------------------------------------------------------------------------
 
-
 def get_log_file(opts):
-    if opts.stdout_file is None:
-        if hasattr(os, 'devnull'):
-            return os.devnull
-        else:
-            return '/dev/null'
-    else:
+    if opts.stdout_file is not None:
         return opts.stdout_file
+
+    try:
+        return os.devnull
+    except AttributeError:
+        return '/dev/null'
 
 
 def get_call_map(opts):
@@ -679,14 +735,16 @@ def get_call_map(opts):
     call_map['server.load_module'] = functools.partial(load_module_file, call_map)
     call_map['server.list_modules'] = list_modules
     call_map['server.flush_logs'] = flush_logs
+    call_map['server.get_logs'] = get_logs
 
     return call_map
 
 
 def server_main(opts):
+    global LOG_FILE
     if opts.daemon:
-        log_file = get_log_file(opts)
-        daemonizator = Daemonizator(opts.working_dir, log_file, log_file)
+        LOG_FILE = get_log_file(opts)
+        daemonizator = Daemonizator(opts.working_dir, LOG_FILE, LOG_FILE)
         is_daemon, daemon_data = daemonizator.daemonize()
         if not is_daemon:
             settings = json.dumps(daemon_data)
@@ -699,7 +757,7 @@ def server_main(opts):
     elif opts.show_settings or opts.stdout_file:
         logger.warning("--show-settings and --stdout-file options ignored for non-daemon mode")
 
-    logger.info("Start listening on {0}".format(opts.listen_addr))
+    logger.info("Start listening on %s", opts.listen_addr)
     srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         call_map = get_call_map(opts)
@@ -710,12 +768,11 @@ def server_main(opts):
 
         # signal to parent process, that prepartion done
         if opts.daemon:
-            server_data = {"daemon_pid": os.getpid(),
-                           "addr": "{}:{}".format(*srv_sock.getsockname())}
+            server_data = {"daemon_pid": os.getpid(), "addr": "{}:{}".format(*srv_sock.getsockname())}
             daemonizator.daemon_ready(server_data)
 
         logger.info("Ready")
-        logger.debug(pformat(call_map))
+        logger.info("Call map = %s", pformat(call_map))
 
         thread_id = 0
         active_threads = {}
@@ -738,22 +795,19 @@ def server_main(opts):
             if not r:
                 conn_timeout = time.time() - last_connection_at
                 if opts.timeout <= conn_timeout and not active_threads:
-                    logger.info("Communication timeout. Exiting")
+                    logger.error("No active client for %s. Exiting", conn_timeout)
                     return
                 continue
 
             last_connection_at = time.time()
 
             sock, fromaddr = srv_sock.accept()
-            logger.info("Get connection from {0}".format(fromaddr))
-            if opts.key_file:
-                sock = ssl.wrap_socket(sock,
-                                       server_side=True,
-                                       certfile=opts.cert_file,
-                                       keyfile=opts.key_file)
+            logger.info("Get connection from %s", fromaddr)
 
-            th = threading.Thread(target=rpc_master,
-                                  args=(Transport(sock), call_map, thread_id, res_queue))
+            if opts.key_file:
+                sock = ssl.wrap_socket(sock, server_side=True, certfile=opts.cert_file, keyfile=opts.key_file)
+
+            th = threading.Thread(target=rpc_worker, args=(Transport(sock), call_map, thread_id, res_queue))
             th.daemon = True
             th.start()
             active_threads[thread_id] = th
@@ -765,6 +819,16 @@ def server_main(opts):
 
 
 # -------------------------------   API  -------------------------------------------------------------------------------
+
+exc_list = [BaseException, SystemExit, KeyboardInterrupt, GeneratorExit, Exception, StopIteration,
+            BufferError, ArithmeticError, FloatingPointError, OverflowError, ZeroDivisionError, AssertionError,
+            AttributeError, EnvironmentError, IOError, OSError, EOFError, ImportError, LookupError, IndexError,
+            KeyError, MemoryError, NameError, UnboundLocalError, ReferenceError, RuntimeError, NotImplementedError,
+            SystemError, TypeError, ValueError, UnicodeError, UnicodeDecodeError, UnicodeEncodeError,
+            UnicodeTranslateError]
+
+
+exc_map = {exc.__name__: exc for exc in exc_list}
 
 
 class SimpleRPCClient(object):
@@ -794,16 +858,22 @@ class SimpleRPCClient(object):
 
         with self._rpc_lock:
             self._tr.send_message(self._name, args, kwargs, timeout=send_timeout)
-            name, (ok, res), kwargs = self._tr.recv_message(timeout=recv_timeout)
+            name, (res, tb, exc_cls_name), kwargs = self._tr.recv_message(timeout=recv_timeout)
 
         assert name is None
         assert kwargs == {}
 
-        if ok:
+        if not exc_cls_name:
             return res
 
-        exc_msg, tb = res
-        raise RuntimeError(exc_msg.decode("utf8") + "\nOriginal traceback:\n" + tb.decode("utf8"))
+        exc_msg = res.decode("utf8")
+        if tb is not None:
+            exc_msg += "\nOriginal traceback:\n" + tb.decode("utf8")
+
+        if exc_cls_name in exc_map:
+            raise exc_map[exc_cls_name](exc_msg)
+
+        raise RuntimeError(exc_msg)
 
     def disconnect(self):
         assert self._tr is not None, "Connection already closed"
