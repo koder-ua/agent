@@ -343,7 +343,7 @@ def worker(iq, oq):
             tb = traceback.format_exc()
             if getattr(func, 'noraise', False):
                 logger.error("Exception during %s: %s.\n%s", func.__name__, exc, tb)
-            oq.put((id, exc, tb, type(exc).__name__))
+            oq.put((id, str(exc), tb, type(exc).__name__))
 
 
 class Pool(object):
@@ -365,7 +365,7 @@ class Pool(object):
         while len(res) < len(vals):
             res.append(self.results_q.get())
 
-        return [(val, tb, exc_cls_name) for _, val, tb, exc_cls_name in sorted(res)]
+        return [(msg, tb, exc_cls_name) for _, msg, tb, exc_cls_name in sorted(res)]
 
     def stop(self):
         for _ in self.threads:
@@ -736,6 +736,8 @@ def get_call_map(opts):
     call_map['server.list_modules'] = list_modules
     call_map['server.flush_logs'] = flush_logs
     call_map['server.get_logs'] = get_logs
+
+    call_map['sys.time'] = time.time
 
     return call_map
 

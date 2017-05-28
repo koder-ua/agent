@@ -177,6 +177,17 @@ def rpc_spawn(cmd, timeout=None, input_data=None, merge_out=False):
 
 
 @noraise
+def rpc_killall(signal=signal.SIGKILL):
+    logger.info("Signal %s is requested for all procs", signal)
+    with procs_lock:
+        for proc in procs.values():
+            try:
+                proc.kill(signal)
+            except:
+                pass
+
+
+@noraise
 def rpc_kill(proc_id, signal=signal.SIGKILL):
     with procs_lock:
         proc = procs[proc_id]

@@ -3,8 +3,7 @@ import struct
 from typing import Any
 
 
-def setup_logger(opts: Any) -> None:
-    ...
+def setup_logger(opts: Any) -> None: ...
 
 
 RPC_TEMPO_MOD = "__rpc_temporary_module__"
@@ -39,7 +38,7 @@ else:
 # ---------------------------------------------  TRANSPORT PROTO -------------------------------------------------------
 # ----------------------------------------------- SERIALIZATION --------------------------------------------------------
 
-if sys.version < (3, 0, 0):
+if sys.version_info < (3, 0, 0):
     BytesType = str
     Unicode = unicode
 else:
