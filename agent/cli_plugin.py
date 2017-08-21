@@ -34,6 +34,10 @@ class Proc(object):
 
     def __init__(self, cmd, timeout, input_data=None, merge_out=True):
         self.input_data = input_data
+
+        if isinstance(cmd, unicode):
+            cmd = cmd.encode("utf8")
+
         self.cmd = cmd
         self.timeout = timeout
         self.merge_out = merge_out

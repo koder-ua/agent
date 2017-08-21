@@ -1,16 +1,20 @@
 import os
+import json
 import stat
 import zlib
 import shutil
 import os.path
+import logging
 import tempfile
 import subprocess
 
-
-from agent_module import noraise
+from agent_module import noraise, tostr
 
 mod_name = "fs"
 __version__ = (0, 1)
+
+
+logger = logging.getLogger("agent.fs")
 
 
 @noraise
@@ -80,7 +84,16 @@ def rpc_unlink(path):
 
 
 @noraise
+def rpc_which(name):
+    try:
+        return subprocess.check_output(["which", name])
+    except subprocess.CalledProcessError:
+        return None
+
+
+@noraise
 def rpc_get_dev_for_file(fname):
+    fname = tostr(fname)
     out = subprocess.check_output(["df", fname])
     dev_link = out.strip().split("\n")[1].split()[0]
 
@@ -92,4 +105,43 @@ def rpc_get_dev_for_file(fname):
         dev_link_next = os.readlink(dev_link)
         dev_link_next = os.path.join(os.path.dirname(dev_link), dev_link_next)
         dev_link = os.path.abspath(dev_link_next)
-    return dev_link
+
+    return tostr(dev_link)
+
+
+def follow_symlink(fname):
+    while os.path.islink(fname):
+        dev_link_next = os.readlink(fname)
+        dev_link_next = os.path.join(os.path.dirname(fname), dev_link_next)
+        fname = os.path.abspath(dev_link_next)
+    return tostr(fname)
+
+
+def fall_down(node, root, res_dict):
+    if 'mountpoint' in node and node['mountpoint']:
+        res_dict[node['mountpoint']] = root
+
+    for ch_node in node.get('children', []):
+        fall_down(ch_node, root, res_dict)
+
+
+def get_mountpoint_to_dev_mapping():
+    lsblk = json.loads(subprocess.check_output(["lsblk", '-a', '--json']))
+    res = {}
+    for node in lsblk['blockdevices']:
+        fall_down(node, node['name'], res)
+    return res
+
+
+@noraise
+def rpc_get_dev_for_file2(fname):
+    fname = os.path.abspath(tostr(fname))
+    fname = follow_symlink(fname)
+    mp_map = get_mountpoint_to_dev_mapping()
+
+    while True:
+        if fname in mp_map:
+            return '/dev/' + mp_map[fname]
+        assert fname != '/', "Can't found dev for {0}".format(fname)
+        fname = os.path.dirname(fname)
+        fname = follow_symlink(fname)
