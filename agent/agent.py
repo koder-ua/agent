@@ -402,7 +402,6 @@ else:
             return vl.encode('utf8')
         return vl
 
-
 def noraise(func):
     func.noraise = True
     return func
@@ -424,6 +423,18 @@ agent_module.Promote = Promote
 
 sys.modules['agent_module'] = agent_module
 
+
+class CommonUtils:
+    @staticmethod
+    def follow_symlink(fname):
+        while os.path.islink(fname):
+            dev_link_next = os.readlink(fname)
+            dev_link_next = os.path.join(os.path.dirname(fname), dev_link_next)
+            fname = os.path.abspath(dev_link_next)
+        return tostr(fname)
+
+
+sys.modules['rpc_common'] = CommonUtils
 
 # ----------------------------------  Utils ----------------------------------------------------------------------------
 

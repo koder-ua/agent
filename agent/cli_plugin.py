@@ -1,6 +1,7 @@
 from __future__ import print_function
 
 import time
+import zlib
 import select
 import signal
 import logging
@@ -200,7 +201,7 @@ def rpc_kill(proc_id, signal=signal.SIGKILL):
 
 
 @noraise
-def rpc_get_updates(proc_id):
+def rpc_get_updates(proc_id, compress_limit=None):
     with procs_lock:
         proc = procs[proc_id]
 
@@ -210,4 +211,9 @@ def rpc_get_updates(proc_id):
         with procs_lock:
             del procs[proc_id]
 
+    if compress_limit is not None:
+        cumulative_out = d_out + d_err
+        if len(cumulative_out) > compress_limit:
+            return ecode, True, zlib.compress(cumulative_out), len(d_out)
+        return ecode, False, cumulative_out, len(d_out)
     return ecode, d_out, d_err

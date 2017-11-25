@@ -7,8 +7,10 @@ import os.path
 import logging
 import tempfile
 import subprocess
+import distutils.spawn
 
 from agent_module import noraise, tostr
+from rpc_common import follow_symlink
 
 mod_name = "fs"
 __version__ = (0, 1)
@@ -109,14 +111,6 @@ def rpc_get_dev_for_file(fname):
     return tostr(dev_link)
 
 
-def follow_symlink(fname):
-    while os.path.islink(fname):
-        dev_link_next = os.readlink(fname)
-        dev_link_next = os.path.join(os.path.dirname(fname), dev_link_next)
-        fname = os.path.abspath(dev_link_next)
-    return tostr(fname)
-
-
 def fall_down(node, root, res_dict):
     if 'mountpoint' in node and node['mountpoint']:
         res_dict[node['mountpoint']] = root
@@ -145,3 +139,8 @@ def rpc_get_dev_for_file2(fname):
         assert fname != '/', "Can't found dev for {0}".format(fname)
         fname = os.path.dirname(fname)
         fname = follow_symlink(fname)
+
+
+@noraise
+def rpc_binarys_exists(names):
+    return [distutils.spawn.find_executable(name) is not None for name in names]
