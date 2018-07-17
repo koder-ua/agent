@@ -623,7 +623,10 @@ class Daemonizator(object):
                 data += ndata
 
             os.close(rpipe)
-            return False, json.loads(data.decode("utf8"))
+            try:
+                return False, json.loads(data.decode("utf8"))
+            except Exception as err:
+                return False, {"err": str(err)}
 
         os.close(rpipe)
         self.redirect_streams()
