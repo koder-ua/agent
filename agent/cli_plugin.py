@@ -89,36 +89,34 @@ class Proc(object):
             raise RuntimeError("Can't kill process")
 
     def watch_proc_th(self):
-        output_size = 0
+        output_size = {self.STDOUT: 0, self.STDERR: 0}
 
-        if self.merge_out:
-            all_pipes = [self.proc.stdout]
-        else:
-            all_pipes = [self.proc.stdout, self.proc.stderr]
-
-        # set non-blocking
-
-        while all_pipes:
-            if self.end_time is not None:
-                timeout = self.end_time - time.time()
-            else:
-                timeout = None
-
-            r, _, e = select.select(all_pipes, [], all_pipes, timeout)
-            if e != []:
-                pass
-
-            if not r:
-                self.on_timeout()
-
-            for pipe in r:
+        def pipe_thread(pipe, code):
+            while True:
                 data = pipe.read(1024)
-                if len(data) == 0:
-                    all_pipes.remove(pipe)
-                    pipe.close()
-                output_size += len(data)
-                code = self.STDOUT if pipe is self.proc.stdout else self.STDERR
+                if not data:
+                    return
+                output_size[code] += len(data)
                 self.output_q.put((code, data))
+
+        ths = [threading.Thread(target=pipe_thread, args=(self.proc.stdout, self.STDOUT))]
+
+        if not self.merge_out:
+            ths.append(threading.Thread(target=pipe_thread, args=(self.proc.stderr, self.STDERR)))
+
+        for th in ths:
+            th.daemon = True
+            th.start()
+
+        while True:
+            for th in ths:
+                try:
+                    th.join(timeout=self.end_time - time.time())
+                except:
+                    self.on_timeout()
+                    break
+            else:
+                break
 
         if self.end_time is not None:
             self.proc.wait()
