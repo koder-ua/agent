@@ -662,16 +662,14 @@ def load_module(call_map, module_name, module_version, module_content):
     logger.info("Loading plugin %r", module_name)
 
     exec(compile(module_content, module_name, 'exec'), globals(), lc)
-    new_methods = find_rpc_funcs(module_name, lc)
+    new_methods = dict(find_rpc_funcs(module_name, lc))
 
     call_map.update(new_methods)
-    logger.info("New module %s with methods %s loaded", module_name, ",".join(name for name, _ in new_methods))
+    logger.info("New module %s with methods %s loaded", module_name, ",".join(new_methods))
     PLUGIN_MODULES[module_name] = (lc, module_version)
-    logger.info(repr(lc))
 
 
 def load_module_file(call_map, module_name, module_version, module_content):
-    lc = {}
     logger.info("Loading plugin %r", module_name)
 
     fd, path = tempfile.mkstemp()
@@ -679,15 +677,13 @@ def load_module_file(call_map, module_name, module_version, module_content):
     os.close(fd)
     mod = load_py(path)
     os.unlink(path)
-
-    new_methods = find_rpc_funcs(module_name, mod.__dict__)
+    new_methods = dict(find_rpc_funcs(module_name, mod.__dict__))
     call_map.update(new_methods)
 
-    logger.info("New module %s with methods %s loaded", module_name, ",".join(name for name, _ in new_methods))
+    logger.info("New module %s with methods %s loaded", module_name, ",".join(new_methods))
 
     PLUGIN_MODULES[module_name] = (mod.__dict__, module_version)
     MODULES.append(mod)
-    logger.info(repr(lc))
 
 
 def get_calls_info(call_map):
