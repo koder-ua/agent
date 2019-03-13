@@ -2,6 +2,7 @@ from __future__ import print_function
 
 import time
 import zlib
+import errno
 import select
 import signal
 import logging
@@ -21,7 +22,7 @@ logger = logging.getLogger("agent.cli")
 
 
 class Proc(object):
-    "Background process class"
+    """Background process class"""
 
     STDOUT = 0
     STDERR = 1
@@ -78,15 +79,19 @@ class Proc(object):
         watch_th.start()
 
     def on_timeout(self):
-        if self.state == self.RUNNING:
-            self.term()
-            self.end_time = time.time() + self.term_timeout
-        elif self.state == self.TERM_SEND:
-            self.kill()
-            self.end_time = time.time() + self.kill_timeout
-        else:
-            assert self.state == self.KILL_SEND
-            raise RuntimeError("Can't kill process")
+        try:
+            if self.state == self.RUNNING:
+                self.term()
+                self.end_time = time.time() + self.term_timeout
+            elif self.state == self.TERM_SEND:
+                self.kill()
+                self.end_time = time.time() + self.kill_timeout
+            else:
+                assert self.state == self.KILL_SEND
+                raise RuntimeError("Can't kill process")
+        except OSError as exc:
+            if exc.errno == errno.ESRCH:
+                pass
 
     def watch_proc_th(self):
         output_size = {self.STDOUT: 0, self.STDERR: 0}
@@ -118,7 +123,7 @@ class Proc(object):
             else:
                 break
 
-        if self.end_time is not None:
+        if self.end_time is None:
             self.proc.wait()
         else:
             self.proc.poll()
