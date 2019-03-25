@@ -175,7 +175,7 @@ async def connect(loop: asyncio.AbstractEventLoop,
     return SimpleRPCClient(AsyncioTransport(reader, writer, addr, timeout=timeout))
 
 
-# ----------------------------------------------  CLI hendlers ---------------------------------------------------------
+# ----------------------------------------------  CLI handlers ---------------------------------------------------------
 
 
 def parse_type(val):

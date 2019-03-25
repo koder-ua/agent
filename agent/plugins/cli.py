@@ -35,6 +35,8 @@ async def async_check_output(cmd: List[str], timeout: int = 30) -> bytes:
     return data[0]
 
 
+# TODO: make this streaming data from process to caller
+# TODO: how to pass exit code back in this case?
 @expose_async
 async def run_cmd(cmd: List[str], timeout: int = None, input_data: bytes = None):
     logger.info("CMD start requested: %s", cmd)

@@ -1,6 +1,3 @@
-from typing import cast, List, Optional, Dict, Any
-
-import functools
 import os
 import json
 import stat
@@ -9,10 +6,10 @@ import shutil
 import os.path
 import logging
 import tempfile
+import functools
 import subprocess
 import distutils.spawn
-
-from typing.io import BinaryIO
+from typing import List, Optional, Dict, Any
 
 
 from .. import rpc
@@ -36,34 +33,10 @@ def listdir(path: str) -> List[str]:
     return os.listdir(path)
 
 
-class ZlibCompressor(rpc.IReadable):
-
-    def __init__(self, fd: BinaryIO, chunk: int = rpc.DEFAULT_CHUNK) -> None:
-        self.fd = fd
-        self.chunk = chunk
-        self.compressor = zlib.compressobj()
-        self.eof = True
-
-    async def read_chunk(self):
-        if self.eof:
-            return b''
-
-        res = b''
-        while not res:
-            data = self.fd.read(self.chunk)
-            if data == b'':
-                self.eof = True
-                return res + self.compressor.flush()
-            res += self.compressor.compress(data)
-
-    def close(self):
-        self.fd.close()
-
-
 @expose
-def get_file(path: str, compress: bool = True) -> rpc.StreamPayload:
-    fd = open(path, "rb")
-    return rpc.StreamPayload(cast(rpc.IReadable, ZlibCompressor(fd) if compress else fd))
+def get_file(path: str, compress: bool = True) -> rpc.IReadableAsync:
+    fd = rpc.ChunkedFile(open(path, "rb"))
+    return rpc.ZlibStreamCompressor(fd) if compress else fd
 
 
 @expose
@@ -81,7 +54,7 @@ async def file_stat(path: str) -> Dict[str, Any]:
 
 
 @expose_async
-async def store_file(path: str, content: rpc.StreamPayload, compressed: bool = False) -> str:
+async def store_file(path: str, content: rpc.IReadableAsync, compressed: bool = False) -> str:
     if path is None:
         path = tempfile.mkstemp()
 
@@ -89,7 +62,7 @@ async def store_file(path: str, content: rpc.StreamPayload, compressed: bool = F
 
     with open(path, "wb") as fd:
         while True:
-            data = await content.fd.read_chunk()
+            data = await content.readany()
 
             if compressed:
                 data = unzlib.decompress(data)
@@ -98,8 +71,8 @@ async def store_file(path: str, content: rpc.StreamPayload, compressed: bool = F
                 if compressed:
                     fd.write(unzlib.flush())
                 break
-
-            fd.write(data)
+            else:
+                fd.write(data)
 
     return path
 
@@ -163,6 +136,14 @@ async def get_mountpoint_to_dev_mapping() -> Dict[str, str]:
     for node in lsblk['blockdevices']:
         fall_down(node, node['name'], res)
     return res
+
+
+def follow_symlink(fname: str) -> str:
+    while os.path.islink(fname):
+        dev_link_next = os.readlink(fname)
+        dev_link_next = os.path.join(os.path.dirname(fname), dev_link_next)
+        fname = os.path.abspath(dev_link_next)
+    return fname
 
 
 @expose_async

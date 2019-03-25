@@ -1,19 +1,17 @@
-import sys
-import traceback
-
 import ssl
-import json
+import sys
+import http
 import hashlib
 import argparse
-from typing import List, Dict, Any
-from asyncio import AbstractEventLoop
+import traceback
+from typing import List, Dict, Any, Tuple
 
 from aiohttp import web, BasicAuth
 
 from . import rpc
 
 # import all plugins to register handlers
-from .plugins import cli, fs
+from .plugins import cli, fs, system
 
 
 MAX_FILE_SIZE = 1 << 30
@@ -28,7 +26,7 @@ def encrypt_key(key: str, salt: str = None) -> str:
 
 def check_key(target: str, for_check: str) -> bool:
     key, salt = target.split("::")
-    curr_password, _ = encrypt_key(for_check, salt)
+    curr_password = encrypt_key(for_check, salt)
     return curr_password == for_check
 
 
@@ -53,31 +51,56 @@ class RPCRequest:
         self.kwargs = kwargs
 
 
-async def unpack_body(request: web.Request):
-    assert request.content_length is not None
-    return RPCRequest(*(await rpc.deserialize(request.content, request, request.content_length)))
-
-
 async def send_body(is_ok: bool, result: Any, writer):
 
     if not is_ok:
         result = result.__class__.__name__, str(result), traceback.format_exc()
 
-    for chunk in rpc.serialize(rpc.CALL_SUCCEEDED if is_ok else rpc.CALL_FAILED, [result], {}):
+    async for chunk in rpc.serialize(rpc.CALL_SUCCEEDED if is_ok else rpc.CALL_FAILED, [result], {}):
         await writer.write(chunk)
 
 
 async def handle_post(request: web.Request):
-    req = await unpack_body(request)
+    req = RPCRequest(*(await rpc.deserialize(request.content)))
+    responce = web.StreamResponse(status=http.HTTPStatus.OK)
+    await responce.prepare(request)
     try:
         if req.func_name in rpc.exposed_async:
             res = await rpc.exposed_async[req.func_name](*req.args, **req.kwargs)
         else:
             res = rpc.exposed[req.func_name](*req.args, **req.kwargs)
     except Exception as exc:
-        await send_body(False, exc, web.StreamResponse(status=500))
+        await send_body(False, exc, responce)
     else:
-        await send_body(True, res, web.StreamResponse(status=200))
+        await send_body(True, res, responce)
+    return responce
+
+
+async def handle_ping(request: web.Request):
+    responce = web.Response(status=http.HTTPStatus.OK)
+    await responce.prepare(request)
+    return responce
+
+
+def get_key_enc() -> Tuple[str, str]:
+    key = "".join(("{:02X}".format(i) for i in ssl.RAND_bytes(16)))
+    return key, encrypt_key(key)
+
+
+def start_rpc_server(addr: str, ssl_cert: str, ssl_key: str, api_key: str):
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(ssl_cert, ssl_key)
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
+    auth = basic_auth_middleware(api_key)
+    app = web.Application(middlewares=[auth], client_max_size=MAX_FILE_SIZE)
+    app.add_routes([web.post('/rpc', handle_post)])
+    app.add_routes([web.get('/ping', handle_ping)])
+
+    host, port = addr.split(":")
+
+    web.run_app(app, host=host, port=int(port), ssl_context=ssl_context)
 
 
 def parse_args(argv: List[str]):
@@ -87,45 +110,28 @@ def parse_args(argv: List[str]):
     server = subparsers.add_parser('server', help='Run web server')
     server.add_argument("--cert", required=True, help="cert file path")
     server.add_argument("--key", required=True, help="key file path")
-    server.add_argument("--password-db", required=True, help="Json file with password database")
-    server.add_argument("--storage-folder", required=True, help="Path to store archives")
-    server.add_argument("addr", default="0.0.0.0:80", help="Address to listen on")
-    server.add_argument("--min-free-space", type=int, default=5,
-                        help="Minimal free space should always be available on device in gb")
+    server.add_argument("--api-key", default=None, help="Json file api key")
+    server.add_argument("--api-key-val", help="Json file api key")
+    server.add_argument("addr", default="0.0.0.0:55443", help="Address to listen on")
 
-    user_add = subparsers.add_parser('user_add', help='Add user to db')
-    user_add.add_argument("--role", required=True, choices=('download', 'upload'), nargs='+', help="User role")
-    user_add.add_argument("--user", required=True, help="User name")
-    user_add.add_argument("--password", default=None, help="Password")
-    user_add.add_argument("db", help="Json password db")
-
-    user_rm = subparsers.add_parser('user_rm', help='Add user to db')
-    user_rm.add_argument("--user", required=True, help="User name")
-    user_rm.add_argument("db", help="Json password db")
+    subparsers.add_parser('gen_key', help='Generate new key')
 
     return p.parse_args(argv[1:])
 
 
-def main(argv: List[str]):
+def main(argv: List[str]) -> int:
     opts = parse_args(argv)
-
     if opts.subparser_name == 'server':
-        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        ssl_context.load_cert_chain(opts.cert, opts.key)
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-
-        auth = basic_auth_middleware(json.load(open(opts.password_db)))
-        app = web.Application(middlewares=[auth], client_max_size=MAX_FILE_SIZE)
-        app.add_routes([web.post('/rpc', handle_post)])
-
-        host, port = opts.addr.split(":")
-
-        web.run_app(app, host=host, port=int(port), ssl_context=ssl_context)
+        if opts.api_key is None:
+            api_key = opts.api_key_val
+        else:
+            api_key = open(opts.key_file).read()
+        start_rpc_server(opts.addr, opts.cert, opts.key, api_key)
     elif opts.subparser_name == 'gen_key':
-        print(encrypt_key("".join(("{:02X}".format(i) for i in ssl.RAND_bytes(16)))))
+        print("Key={}\nenc_key={}".format(*get_key_enc()))
     else:
         assert False, "Unknown cmd"
+    return 0
 
 
 if __name__ == "__main__":

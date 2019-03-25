@@ -1,7 +1,12 @@
 import abc
+import base64
 import json
+import zlib
 
-from typing import Any, Dict, List, Tuple, Iterator, Optional, Callable
+from async_generator import async_generator, yield_
+
+from typing import Any, Dict, List, Tuple, Optional, Callable
+from typing.io import BinaryIO
 
 exposed = {}
 exposed_async = {}
@@ -16,89 +21,107 @@ CALL_FAILED = 'fail'
 CALL_SUCCEEDED = 'success'
 
 
+def validate_name(name: str):
+    assert not name.startswith("_")
+
+
 def expose_func(module: str, func: Callable):
+    validate_name(module)
+    validate_name(func.__name__)
     exposed[module + "::" + func.__name__] = func
     return func
 
+
 def expose_func_async(module: str, func: Callable):
+    validate_name(module)
+    validate_name(func.__name__)
     exposed_async[module + "::" + func.__name__] = func
     return func
 
 
-class IClousable(metaclass=abc.ABCMeta):
+# async stream classes
+
+
+class IReadableAsync:
     @abc.abstractmethod
-    async def close(self):
+    async def readany(self) -> bytes:
         pass
 
 
-class IReadable(IClousable):
-    @abc.abstractmethod
-    async def read_chunk(self):
-        pass
-
-
-class FDIReadable(IReadable):
-    def __init__(self, fd, chunk_size: int = DEFAULT_CHUNK) -> None:
-        self.chunk_size = chunk_size
+class ChunkedFile(IReadableAsync):
+    def __init__(self, fd: BinaryIO, chunk: int = DEFAULT_CHUNK) -> None:
         self.fd = fd
+        self.chunk = chunk
 
-    async def read_chunk(self):
-        return self.fd.read(self.chunk_size)
+    async def readany(self) -> bytes:
+        if self.fd.closed:
+            return b""
 
-    def close(self):
-        self.fd.close()
+        data = self.fd.read(self.chunk)
+        if not data:
+            self.fd.close()
+        return data
 
 
-class StreamPayload:
-    def __init__(self, fd: IReadable) -> None:
+class ZlibStreamCompressor(IReadableAsync):
+
+    def __init__(self, fd: IReadableAsync) -> None:
         self.fd = fd
+        self.compressor = zlib.compressobj()
+        self.eof = False
 
-    def close(self):
-        self.fd.close()
+    async def readany(self) -> bytes:
+        if self.eof:
+            return b''
+
+        res = b''
+        while not res:
+            data = await self.fd.readany()
+            if data == b'':
+                self.eof = True
+                return res + self.compressor.flush()
+            res += self.compressor.compress(data)
+        return res
 
 
-class StreamReaderProxy(IReadable):
-    def __init__(self, data: bytes, reader: IReadable, req: IClousable) -> None:
+class StreamReaderProxy(IReadableAsync):
+    def __init__(self, data: bytes, reader: IReadableAsync) -> None:
         self.data = data
         self.reader = reader
-        self.req = req
 
-    async def read_chunk(self) -> bytes:
+    async def readany(self) -> bytes:
         if self.data:
             res = self.data
             self.data = b""
         else:
-            res = self.reader.read_chunk()
+            res = await self.reader.readany()
         return res
 
-    async def close(self):
-        await self.req.close()
 
-
-def prepare(args: List, kwargs: Dict) -> Tuple[Dict[str, Any], Optional[StreamPayload]]:
+def prepare_for_json(args: List, kwargs: Dict) -> Tuple[Dict[str, Any], Optional[IReadableAsync]]:
     streams = []
-    p_args = do_prepare(args, streams)
-    p_kwargs = do_prepare(kwargs, streams)
+    p_args = do_prepare_for_json(args, streams)
+    p_kwargs = do_prepare_for_json(kwargs, streams)
     return {'args': p_args, 'kwargs': p_kwargs}, None if streams == [] else streams[0]
 
 
-def do_prepare(val: Any, streams: List[StreamPayload]) -> Any:
+def do_prepare_for_json(val: Any, streams: List[IReadableAsync]) -> Any:
     vt = type(val)
     if vt in (int, float, str, bool) or val is None:
         return val
 
     if vt is bytes:
-        return {CUSTOM_TYPE_KEY: BYTES_TYPE, 'val': val.encode("utf8")}
+        return {CUSTOM_TYPE_KEY: BYTES_TYPE, 'val': base64.b64encode(val).decode('ascii')}
 
-    if vt is list:
-        return [do_prepare(i, streams) for i in val]
+    if vt is list or vt is tuple:
+        return [do_prepare_for_json(i, streams) for i in val]
 
     if vt is dict:
         assert all(isinstance(key, str) for key in val)
         assert CUSTOM_TYPE_KEY not in val, "Can't use {:!r} as key serializable dict".format(CUSTOM_TYPE_KEY)
-        return {key: do_prepare(value, streams) for key, value in val.items()}
+        return {key: do_prepare_for_json(value, streams) for key, value in val.items()}
 
-    if vt is StreamPayload:
+    if isinstance(val, IReadableAsync):
         assert len(streams) == 0, "Params can only contains single stream"
         streams.append(val)
         return {CUSTOM_TYPE_KEY: STREAM_TYPE}
@@ -106,7 +129,7 @@ def do_prepare(val: Any, streams: List[StreamPayload]) -> Any:
     raise TypeError("Can't serialize value of type {}".format(vt))
 
 
-def unprepare(data: Dict[str, Any], stream: StreamReaderProxy) -> Tuple[str, List, Dict, bool]:
+def unpack_from_json(data: Dict[str, Any], stream: IReadableAsync) -> Tuple[str, List, Dict, bool]:
     args = data.pop('args')
     assert type(args) is list
 
@@ -118,66 +141,80 @@ def unprepare(data: Dict[str, Any], stream: StreamReaderProxy) -> Tuple[str, Lis
     assert all(isinstance(key, str) for key in kwargs)
 
     streams = [stream]
-    args = do_unprepare(args, streams)
-    kwargs = do_unprepare(kwargs, streams)
+    args = do_unpack_from_json(args, streams)
+    kwargs = do_unpack_from_json(kwargs, streams)
     return name, args, kwargs, streams == []
 
 
-def do_unprepare(val: Any, streams: List[StreamReaderProxy]) -> Any:
+def do_unpack_from_json(val: Any, streams: List[IReadableAsync]) -> Any:
     vt = type(val)
     if vt in (int, float, str, bool) or val is None:
         return val
 
     if vt is list:
-        return [do_unprepare(i, streams) for i in val]
+        return [do_unpack_from_json(i, streams) for i in val]
 
     if vt is dict:
-        cctype = vt.get(CUSTOM_TYPE_KEY)
+        cctype = val.get(CUSTOM_TYPE_KEY)
         if cctype is None:
             assert all(isinstance(key, str) for key in val)
-            return {key: do_unprepare(value, streams) for key, value in val.items()}
+            return {key: do_unpack_from_json(value, streams) for key, value in val.items()}
         elif cctype == STREAM_TYPE:
             assert streams
             return streams.pop()
         elif cctype == BYTES_TYPE:
-            return vt['val'].decode("utf8")
+            return base64.b64decode(val['val'].encode('ascii'))
 
     raise TypeError("Can't deserialize value of type {}".format(vt))
 
 
-def serialize(name: str, args: List, kwargs: Dict[str, Any], read_chunk: int = DEFAULT_CHUNK) -> Iterator[bytes]:
-    args, maybe_stream = prepare(args, kwargs)
+@async_generator
+async def serialize(name: str, args: List, kwargs: Dict[str, Any]):
+    args, maybe_stream = prepare_for_json(args, kwargs)
     args['name'] = name
     serialized_args = json.dumps(args).encode("utf8")
     assert EOD_MARKER not in serialized_args
-    yield serialized_args + EOD_MARKER
+    await yield_(serialized_args + EOD_MARKER)
     if maybe_stream is not None:
         while True:
-            data = maybe_stream.fd.read_chunk()
+            data = await maybe_stream.readany()
             assert isinstance(data, bytes), "Stream must yield bytes type, not {}".format(type(data))
             if data == b'':
                 break
-            yield data
+            await yield_(data)
 
 
-async def deserialize(data_stream, req, content_length: int, chunk: int = DEFAULT_CHUNK):
-    # read header
+async def deserialize(data_stream, allow_streamed: bool = False):
+    """
+    Unpack request from aiohttp.StreamReader or compatible stream
+    """
     data = b""
-    eof_offset = 0
+    eof_found = False
     while True:
-        data += (await data_stream.read(chunk))
+        new_chunk = await data_stream.readany()
+        data += new_chunk
+        if not new_chunk:
+            eof_found = True
+
         eof_offset = data.find(EOD_MARKER)
         if eof_offset >= 0:
             break
 
-    js_data = json.loads(data[:eof_offset].decode('utf8'))
-    stream = StreamReaderProxy(data[eof_offset:], data_stream, req)
-    name, args, kwargs, use_stream = unprepare(js_data, stream)
+        if not new_chunk:
+            assert new_chunk, "Stream closed, but no EOD_MARKER found\n%r" % (data,)
 
-    if not use_stream:
-        await stream.close()
-        assert eof_offset == len(data)
-        assert content_length == eof_offset
+    js_data = json.loads(data[:eof_offset].decode('utf8'))
+    stream = StreamReaderProxy(data[eof_offset:], data_stream)
+    name, args, kwargs, use_stream = unpack_from_json(js_data, stream)
+
+    if use_stream:
+        if not allow_streamed:
+            raise ValueError("Streaming not allowed for this call")
+    else:
+        assert eof_offset + 1 == len(data), "{} != {}".format(eof_offset + 1, len(data))
+        if not eof_found:
+            new_chunk = await data_stream.readany()
+            assert new_chunk == b'', "Extra data after the end of json part, not consumed"
 
     return name, args, kwargs
 
