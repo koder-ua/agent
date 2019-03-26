@@ -36,65 +36,68 @@ async def process_rpc_results(resp: aiohttp.ClientResponse, allow_streamed: bool
 
 class AsyncRPCClient(object):
     def __init__(self, url: str, ssl_cert_file: Optional[str], access_key: str, user: str = USER_NAME) -> None:
-        self.rpc_url = url + '/rpc'
-        self.ping_url = url + '/ping'
-        self.access_key = access_key
-        self.user = user
-        self.request_in_progress = False
-        self.http_conn = aiohttp.ClientSession()
-        self.connected = False
+        self._rpc_url = url + '/rpc'
+        self._ping_url = url + '/ping'
+        self._access_key = access_key
+        self._user = user
+        self._request_in_progress = False
+        self._http_conn = aiohttp.ClientSession()
+        self._connected = False
 
         if ssl_cert_file:
-            self.ssl = ssl.create_default_context(cafile=ssl_cert_file)
+            self._ssl = ssl.create_default_context(cafile=ssl_cert_file)
         else:
-            self.ssl = None
+            self._ssl = None
 
-        self.auth = aiohttp.BasicAuth(login=user, password=self.access_key)
-        self.post_params = {"url": self.rpc_url, "ssl": self.ssl, "auth": self.auth}
+        self._auth = aiohttp.BasicAuth(login=user, password=self._access_key)
+        self._post_params = {"url": self._rpc_url, "ssl": self._ssl, "auth": self._auth}
 
     @property
     def streamed(self) -> 'StreamedProxy':
         return StreamedProxy(self)
 
     async def wait_ready(self, timeout: float = 30, period: float = 0.1):
-        etime = time.time() - timeout
+        etime = time.time() + timeout
         wtime = timeout
+
+        async def ping():
+            async with self._http_conn.get(self._ping_url, ssl=self._ssl) as resp:
+                pass
+
         while wtime > 0:
             try:
-                await asyncio.wait_for(self.__ping__(), wtime)
+                await asyncio.wait_for(ping(), wtime)
                 break
             except aiohttp.ClientConnectionError:
                 await asyncio.sleep(period)
             wtime = etime - time.time()
-
-    async def __ping__(self):
-        async with self.http_conn.get(self.ping_url, ssl=self.ssl) as resp:
-            pass
+        else:
+            raise aiohttp.ClientConnectionError("Can't connect to {}".format(self._rpc_url))
 
     async def __aenter__(self) -> 'AsyncRPCClient':
-        await self.http_conn.__aenter__()
-        self.connected = True
+        await self._http_conn.__aenter__()
+        self._connected = True
         return self
 
     async def __aexit__(self, x, y, z):
-        assert self.connected
-        await self.http_conn.__aexit__(x, y, z)
-        self.connected = False
+        assert self._connected
+        await self._http_conn.__aexit__(x, y, z)
+        self._connected = False
 
-    def __prepare_call__(self, name, args, kwargs) -> Tuple[float, Any]:
-        assert self.connected
-        assert not self.request_in_progress, "Can't share connection between requests"
+    def _prepare_call(self, name, args, kwargs) -> Tuple[float, Any]:
+        assert self._connected
+        assert not self._request_in_progress, "Can't share connection between requests"
         timeout = kwargs.pop("_call_timeout", None)
         return timeout, rpc.serialize(name, args, kwargs)
 
     async def __call__(self, name: str, args: List, kwargs: Dict[str, Any]):
-        _, data = self.__prepare_call__(name, args, kwargs)
-        async with self.http_conn.post(**self.post_params, data=data) as resp:
+        _, data = self._prepare_call(name, args, kwargs)
+        async with self._http_conn.post(**self._post_params, data=data) as resp:
             return await process_rpc_results(resp)
 
-    def __call_streamed__(self, name: str, args: List, kwargs: Dict[str, Any]):
-        _, data = self.__prepare_call__(name, args, kwargs)
-        return StreamedCall(self.http_conn, self.post_params, data)
+    def _call_streamed(self, name: str, args: List, kwargs: Dict[str, Any]):
+        _, data = self._prepare_call(name, args, kwargs)
+        return StreamedCall(self._http_conn, self._post_params, data)
 
     def __getattr__(self, name) -> 'RPCModuleProxy':
         return RPCModuleProxy(self, name)
@@ -131,7 +134,7 @@ class RPCFuncProxy:
 
     def __call__(self, *args, **kwargs):
         if self.streamed:
-            return self.rpc.__call_streamed__(self.name, list(args), kwargs)  # async withable
+            return self.rpc._call_streamed(self.name, list(args), kwargs)
         else:
             return self.rpc(self.name, list(args), kwargs)  # awaitable
 

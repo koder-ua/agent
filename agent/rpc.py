@@ -23,6 +23,7 @@ CALL_SUCCEEDED = 'success'
 
 def validate_name(name: str):
     assert not name.startswith("_")
+    assert name != 'streamed'
 
 
 def expose_func(module: str, func: Callable):
@@ -204,7 +205,7 @@ async def deserialize(data_stream, allow_streamed: bool = False):
             assert new_chunk, "Stream closed, but no EOD_MARKER found\n%r" % (data,)
 
     js_data = json.loads(data[:eof_offset].decode('utf8'))
-    stream = StreamReaderProxy(data[eof_offset:], data_stream)
+    stream = StreamReaderProxy(data[eof_offset + 1:], data_stream)
     name, args, kwargs, use_stream = unpack_from_json(js_data, stream)
 
     if use_stream:
