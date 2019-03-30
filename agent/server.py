@@ -1,27 +1,18 @@
 import ssl
 import sys
 import http
-import hashlib
 import argparse
 import traceback
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 from aiohttp import web, BasicAuth
 
 from . import rpc
+from .ssh_deploy import get_key_enc, encrypt_key
+from .common import USER_NAME, MAX_FILE_SIZE
 
 # import all plugins to register handlers
 from .plugins import cli, fs, system
-
-
-MAX_FILE_SIZE = 1 << 30
-USER_NAME = 'rpc_client'
-
-
-def encrypt_key(key: str, salt: str = None) -> str:
-    if salt is None:
-        salt = "".join("{:02X}".format(i) for i in ssl.RAND_bytes(16))
-    return hashlib.sha512(key.encode('utf-8') + salt.encode('utf8')).hexdigest() + "::" + salt
 
 
 def check_key(target: str, for_check: str) -> bool:
@@ -33,6 +24,9 @@ def check_key(target: str, for_check: str) -> bool:
 def basic_auth_middleware(key: str):
     @web.middleware
     async def basic_auth(request, handler):
+        if request.path == '/ping':
+            return await handler(request)
+
         basic_auth = request.headers.get('Authorization')
         if basic_auth:
             auth = BasicAuth.decode(basic_auth)
@@ -82,11 +76,6 @@ async def handle_ping(request: web.Request):
     return responce
 
 
-def get_key_enc() -> Tuple[str, str]:
-    key = "".join(("{:02X}".format(i) for i in ssl.RAND_bytes(16)))
-    return key, encrypt_key(key)
-
-
 def start_rpc_server(addr: str, ssl_cert: str, ssl_key: str, api_key: str):
     ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ssl_context.load_cert_chain(ssl_cert, ssl_key)
@@ -110,9 +99,9 @@ def parse_args(argv: List[str]):
     server = subparsers.add_parser('server', help='Run web server')
     server.add_argument("--cert", required=True, help="cert file path")
     server.add_argument("--key", required=True, help="key file path")
-    server.add_argument("--api-key", default=None, help="Json file api key")
+    server.add_argument("--api-key", default=None, help="api key file")
     server.add_argument("--api-key-val", help="Json file api key")
-    server.add_argument("addr", default="0.0.0.0:55443", help="Address to listen on")
+    server.add_argument("--addr", default="0.0.0.0:55443", help="Address to listen on")
 
     subparsers.add_parser('gen_key', help='Generate new key')
 
@@ -122,15 +111,12 @@ def parse_args(argv: List[str]):
 def main(argv: List[str]) -> int:
     opts = parse_args(argv)
     if opts.subparser_name == 'server':
-        if opts.api_key is None:
-            api_key = opts.api_key_val
-        else:
-            api_key = open(opts.key_file).read()
+        api_key = opts.api_key_val if opts.api_key is None else open(opts.api_key).read()
         start_rpc_server(opts.addr, opts.cert, opts.key, api_key)
     elif opts.subparser_name == 'gen_key':
         print("Key={}\nenc_key={}".format(*get_key_enc()))
     else:
-        assert False, "Unknown cmd"
+        assert False, "Unknown cmd {}".format(opts.subparser_name)
     return 0
 
 

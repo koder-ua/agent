@@ -13,8 +13,9 @@ from typing import List, Optional, Dict, Any
 
 
 from .. import rpc
-from .cli import async_check_output
+from .. import utils
 
+MAX_FILE_SIZE = 8 * (1 << 20)
 
 expose = functools.partial(rpc.expose_func, "fs")
 expose_async = functools.partial(rpc.expose_func_async, "fs")
@@ -37,6 +38,14 @@ def listdir(path: str) -> List[str]:
 def get_file(path: str, compress: bool = True) -> rpc.IReadableAsync:
     fd = rpc.ChunkedFile(open(path, "rb"))
     return rpc.ZlibStreamCompressor(fd) if compress else fd
+
+
+@expose
+def get_file_no_stream(path: str, compress: bool = True) -> rpc.IReadableAsync:
+    if os.stat(path).st_size > MAX_FILE_SIZE:
+        raise ValueError("File to large for single-shot stransfer")
+    fc = open(path, "rb").read()
+    return zlib.compress(fc) if compress else fc
 
 
 @expose
@@ -100,14 +109,14 @@ def unlink(path: str):
 @expose_async
 async def which(name: str) -> Optional[str]:
     try:
-        return (await async_check_output(["which", name])).decode("utf8")
+        return (await utils.run(["which", name])).out
     except subprocess.CalledProcessError:
         return None
 
 
 @expose_async
 async def get_dev_for_file(fname: str):
-    out = (await async_check_output(["df", fname])).decode("utf8")
+    out = (await utils.run(["df", fname])).out
     dev_link = out.strip().split("\n")[1].split()[0]
 
     if dev_link == 'udev':
@@ -131,7 +140,7 @@ def fall_down(node: Dict, root: str, res_dict: Dict[str, str]):
 
 
 async def get_mountpoint_to_dev_mapping() -> Dict[str, str]:
-    lsblk = json.loads((await async_check_output(["lsblk", '-a', '--json']))).decode("utf8")
+    lsblk = json.loads((await utils.run(["lsblk", '-a', '--json']))).out
     res = {}
     for node in lsblk['blockdevices']:
         fall_down(node, node['name'], res)

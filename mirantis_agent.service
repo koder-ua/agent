@@ -1,10 +1,10 @@
 [Unit]
-Description=Mirantis ceph reporting agent
+Description=Mirantis rpc agent
 After=multi-user.target
 
 [Service]
+WorkingDirectory=/opt/mirantis/agent
 Environment=PYTHONUNBUFFERED=1
 Type=simple
-User=
-ExecStart=bash /opt/ceph_report/run.sh
+ExecStart=/usr/bin/python3.5 /opt/mirantis/agent/agent/run_service.py /opt/mirantis/agent
 StandardOutput=null

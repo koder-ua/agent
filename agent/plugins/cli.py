@@ -1,17 +1,13 @@
-from __future__ import print_function
-
 import zlib
 import time
 import signal
 import asyncio
 import logging
 import functools
-import subprocess
-from typing import List, Optional
-
+from typing import Optional, Tuple, List
 
 from .. import rpc
-
+from .. import utils
 
 expose = functools.partial(rpc.expose_func, "fs")
 expose_async = functools.partial(rpc.expose_func_async, "fs")
@@ -19,42 +15,41 @@ expose_async = functools.partial(rpc.expose_func_async, "fs")
 logger = logging.getLogger("agent.cli")
 
 
-all_procs = []
-last_killall_requested = 0
-last_killall_sig = None  # type: Optional[int]
-
-
-async def async_check_output(cmd: List[str], timeout: int = 30) -> bytes:
-    proc = await asyncio.create_subprocess_exec(*cmd,
-                                                timeout=timeout,
-                                                stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.STDOUT)
-    data = await proc.communicate()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, cmd=cmd, output=data[0])
-    return data[0]
+all_procs: List[asyncio.subprocess.Process] = []
+last_killall_requested: int = 0
+last_killall_sig: Optional[int] = None
 
 
 # TODO: make this streaming data from process to caller
 # TODO: how to pass exit code back in this case?
 @expose_async
-async def run_cmd(cmd: List[str], timeout: int = None, input_data: bytes = None):
-    logger.info("CMD start requested: %s", cmd)
-    t = time.time()
-    proc = await asyncio.create_subprocess_exec(*cmd,
-                                                timeout=timeout,
-                                                stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.STDOUT,
-                                                stdin=None if input_data else asyncio.subprocess.PIPE)
+async def run_cmd(cmd: utils.CmdType,
+                  timeout: int = None,
+                  input_data: bytes = None,
+                  compress: bool = True,
+                  merge_err: bool = False,
+                  output_to_devnull: bool = False,
+                  term_timeout: int = 1) -> Tuple[int, bytes, bytes]:
+
+    start_time = time.time()
+    proc, input_data = await utils.start_proc(cmd, input_data, merge_err, output_to_devnull)
+
     # there a race between creating of process and killing all processes, fix it
-    if t < last_killall_requested:
+    if start_time < last_killall_requested:
         assert last_killall_sig is not None
         proc.send_signal(last_killall_sig)
-    else:
-        all_procs.append(proc)
 
-    data = await proc.stdout.communicate(input_data)
-    return [proc.returncode, zlib.compress(data[0])]
+    all_procs.append(proc)
+
+    _, out, err = await utils.run_proc_timeout(cmd, proc, timeout=timeout,
+                                               input_data=input_data, term_timeout=term_timeout)
+
+    if compress:
+        out = zlib.compress(out)
+        if err is not None:
+            err = zlib.compress(err)
+
+    return proc.returncode, out, err
 
 
 @expose
@@ -69,6 +64,6 @@ def killall(signal_num: int = signal.SIGKILL):
 
     for proc in all_procs:
         try:
-            proc.kill(signal_num)
+            proc.send_signal(signal_num)
         except:
             pass

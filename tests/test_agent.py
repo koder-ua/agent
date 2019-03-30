@@ -6,7 +6,7 @@ import subprocess
 import contextlib
 
 
-from agent.client import AsyncRPCClient
+from agent.client import AsyncRPCClient, BlockType
 from agent.server import get_key_enc
 
 
@@ -23,8 +23,7 @@ def spawn_rpc():
     proc = []
 
     def closure():
-        cmd = "python -m agent.server server --cert {} --key {} --api-key-val {} {}"
-        cmd = cmd.format(test_cert, test_key, enc_key, test_addr)
+        cmd = f"python -m agent.server server --cert {test_cert} --key {test_key} --api-key-val {enc_key} --addr {test_addr}"
         proc.append(subprocess.Popen(cmd.split()))
 
     th = threading.Thread(target=closure, daemon=True)
@@ -57,25 +56,19 @@ async def test_ping(conn):
 async def test_file_transfer(conn):
     fname = os.path.abspath(test_cert)
     async with conn.streamed.fs.get_file(fname, compress=False) as stream:
-        val = b''
-        while True:
-            data = await stream.readany()
-            if data == b'':
-                break
-            val += data
-
+        data = b""
+        async for tp, chunk in stream:
+            assert tp == BlockType.binary
+            data += chunk
         dt = open(fname, 'rb').read()
-        assert val == dt, "{} != {}".format(len(val), len(dt))
+        assert data == dt, "{} != {}".format(len(data), len(dt))
 
     async with conn.streamed.fs.get_file(fname, compress=True) as stream:
-        val = b""
-        while True:
-            data = await stream.readany()
-            if data == b'':
-                break
-            val += data
-
-        assert zlib.decompress(val) == open(fname, 'rb').read()
+        data = b""
+        async for tp, chunk in stream:
+            assert tp == BlockType.binary
+            data += chunk
+        assert zlib.decompress(data) == open(fname, 'rb').read()
 
 
 @test
@@ -83,11 +76,9 @@ async def test_large_file_transfer(conn):
     fname = "/home/koder/Downloads/ops.tar.gz"
     with open(fname, 'rb') as fd:
         async with conn.streamed.fs.get_file(fname, compress=False) as stream:
-            while True:
-                data = await stream.readany()
-                if data == b'':
-                    break
-                assert fd.read(len(data)) == data
+            async for tp, chunk in stream:
+                assert tp == BlockType.binary
+                assert fd.read(len(chunk)) == chunk
 
         assert fd.read() == b''
 
