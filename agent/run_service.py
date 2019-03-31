@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3.5
 import os
 import sys
 from pathlib import Path
@@ -11,14 +11,14 @@ if __name__ == "__main__":
     pypath = environ.get("PYTHONPATH", "")
 
     if (service_path / 'libs').is_dir():
-         pypath += ":{}".format(service_path / 'libs')
+         pypath += ":" + str(service_path / 'libs')
 
     pypath += ":" + str(service_path)
     environ["PYTHONPATH"] = pypath
 
     if (service_path / 'python').is_dir():
         environ['PYTHONHOME'] = str(service_path / 'python')
-        pythonbins = list((service_path / 'python').glob("python3.[56789]"))
+        pythonbins = list((service_path / 'python').glob("python3.[789]"))
         assert len(pythonbins) == 1
         pythonbin = str(pythonbins[0])
     else:

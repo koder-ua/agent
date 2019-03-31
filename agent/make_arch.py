@@ -41,7 +41,9 @@ def copy_code(package_dir: Path, target: Path, root_dir: Path):
 
 
 def copy_py_binary(py_name: str, bin_target: Path):
-    shutil.copyfile(find_executable(py_name), bin_target)
+    py_path = find_executable(py_name)
+    assert py_path is not None
+    shutil.copyfile(py_path, bin_target)
     bin_target.chmod(stat.S_IXUSR | stat.S_IRUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
 
 
@@ -80,13 +82,13 @@ def copy_py_lib(py_name: str, lib_target: Path):
         if tgt.is_dir():
             shutil.rmtree(tgt)
 
-    for name in lib_target.iterdir():
-        if name.name.startswith("config-") and name.is_dir():
-            shutil.rmtree(name)
+    for itemname in lib_target.iterdir():
+        if itemname.name.startswith("config-") and itemname.is_dir():
+            shutil.rmtree(itemname)
 
-    for name in lib_target.rglob("__pycache__"):
-        if name.is_dir():
-            shutil.rmtree(name)
+    for pycache_name in lib_target.rglob("__pycache__"):
+        if pycache_name.is_dir():
+            shutil.rmtree(pycache_name)
 
 
 def parse_arge(argv: List[str]) -> Any:

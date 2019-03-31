@@ -1,3 +1,4 @@
+import errno
 import os
 import json
 import stat
@@ -9,8 +10,7 @@ import tempfile
 import functools
 import subprocess
 import distutils.spawn
-from typing import List, Optional, Dict, Any
-
+from typing import List, Optional, Dict, Any, Tuple
 
 from .. import rpc
 from .. import utils
@@ -109,14 +109,14 @@ def unlink(path: str):
 @expose_async
 async def which(name: str) -> Optional[str]:
     try:
-        return (await utils.run(["which", name])).out
+        return (await utils.run(["which", name])).stdout
     except subprocess.CalledProcessError:
         return None
 
 
 @expose_async
 async def get_dev_for_file(fname: str):
-    out = (await utils.run(["df", fname])).out
+    out = (await utils.run(["df", fname])).stdout
     dev_link = out.strip().split("\n")[1].split()[0]
 
     if dev_link == 'udev':
@@ -140,7 +140,7 @@ def fall_down(node: Dict, root: str, res_dict: Dict[str, str]):
 
 
 async def get_mountpoint_to_dev_mapping() -> Dict[str, str]:
-    lsblk = json.loads((await utils.run(["lsblk", '-a', '--json']))).out
+    lsblk = json.loads((await utils.run(["lsblk", '-a', '--json']))).stdout
     res = {}
     for node in lsblk['blockdevices']:
         fall_down(node, node['name'], res)
@@ -164,7 +164,7 @@ async def get_dev_for_file2(fname: str) -> str:
     while True:
         if fname in mp_map:
             return '/dev/' + mp_map[fname]
-        assert fname != '/', "Can't found dev for {0}".format(fname)
+        assert fname != '/', f"Can't found dev for {fname}"
         fname = os.path.dirname(fname)
         fname = follow_symlink(fname)
 
@@ -172,3 +172,53 @@ async def get_dev_for_file2(fname: str) -> str:
 @expose
 def binarys_exists(names: List[str]) -> List[str]:
     return [distutils.spawn.find_executable(name) is not None for name in names]
+
+
+
+@expose
+def find_pids_for_cmd(bname: str) -> List[int]:
+    bin_path = distutils.spawn.find_executable(bname)
+
+    if not bin_path:
+        raise NameError(f"Can't found binary path for {bname!r}")
+
+    res = []
+    for name in os.listdir('/proc'):
+        if name.isdigit() and os.path.isdir(f'/proc/{name}'):
+            exe = f'/proc/{name}/exe'
+            if os.path.exists(exe) and os.path.islink(exe) and bin_path == os.readlink(exe):
+                res.append(int(name))
+
+    logger.debug(f"Find pids for binary {bname} = {res}")
+
+    return res
+
+
+@expose
+def get_block_devs_info(filter_virtual : bool = True) -> Dict[str, Tuple[bool, str]]:
+    res = {}
+    for name in os.listdir("/sys/block"):
+        rot_fl = f"/sys/block/{name}/queue/rotational"
+        sched_fl = f"/sys/block/{name}/queue/scheduler"
+        if os.path.isfile(rot_fl) and os.path.isfile(sched_fl):
+            if filter_virtual and follow_symlink(f'/sys/block/{name}').startswith('/sys/devices/virtual'):
+                continue
+            res[name] = (
+                open(rot_fl).read().strip() == 1,
+                open(sched_fl).read()
+            )
+    return res
+
+
+@expose
+def count_sockets_for_process(pid: int) -> int:
+    count = 0
+    for fd in os.listdir('/proc/{0}/fd'.format(pid)):
+        try:
+            if stat.S_ISSOCK(os.stat('/proc/{0}/fd/{1}'.format(pid, fd)).st_mode):
+                count += 1
+        except OSError as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+
+    return count

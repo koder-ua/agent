@@ -1,6 +1,5 @@
 [Unit]
 Description=Mirantis rpc agent
-After=multi-user.target
 
 [Service]
 WorkingDirectory=/opt/mirantis/agent
@@ -8,3 +7,6 @@ Environment=PYTHONUNBUFFERED=1
 Type=simple
 ExecStart=/usr/bin/python3.5 /opt/mirantis/agent/agent/run_service.py /opt/mirantis/agent
 StandardOutput=null
+
+[Install]
+WantedBy=multi-user.target

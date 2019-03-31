@@ -4,13 +4,14 @@ import signal
 import asyncio
 import logging
 import functools
+import subprocess
 from typing import Optional, Tuple, List
 
 from .. import rpc
 from .. import utils
 
-expose = functools.partial(rpc.expose_func, "fs")
-expose_async = functools.partial(rpc.expose_func_async, "fs")
+expose = functools.partial(rpc.expose_func, "cli")
+expose_async = functools.partial(rpc.expose_func_async, "cli")
 
 logger = logging.getLogger("agent.cli")
 
@@ -41,13 +42,18 @@ async def run_cmd(cmd: utils.CmdType,
 
     all_procs.append(proc)
 
-    _, out, err = await utils.run_proc_timeout(cmd, proc, timeout=timeout,
-                                               input_data=input_data, term_timeout=term_timeout)
+    try:
+        res = await utils.run_proc_timeout(cmd, proc, timeout=timeout,
+                                           input_data=input_data, term_timeout=term_timeout)
+    except subprocess.CalledProcessError as exc:
+        res = utils.CMDResult(exc.cmd, stdout_b=exc.stdout, stderr_b=exc.stderr, returncode=exc.returncode)
 
     if compress:
-        out = zlib.compress(out)
-        if err is not None:
-            err = zlib.compress(err)
+        out = zlib.compress(res.stdout_b)
+        err = None if res.stderr_b is None else zlib.compress(res.stderr_b)
+    else:
+        out = res.stdout_b
+        err = res.stderr_b
 
     return proc.returncode, out, err
 

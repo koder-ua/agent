@@ -1,6 +1,6 @@
 import logging
 import functools
-
+from typing import List
 
 from .. import rpc
 
@@ -20,3 +20,8 @@ def ping(data: str = "") -> str:
 @expose
 def test(*args, **kwargs):
     return [args, kwargs]
+
+
+@expose
+def get_logs() -> str:
+    return ""

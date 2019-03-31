@@ -9,10 +9,10 @@ from aiohttp import web, BasicAuth
 
 from . import rpc
 from .ssh_deploy import get_key_enc, encrypt_key
-from .common import USER_NAME, MAX_FILE_SIZE
+from .common import USER_NAME, MAX_FILE_SIZE, DEFAULT_PORT
 
 # import all plugins to register handlers
-from .plugins import cli, fs, system
+from .plugins import cli, fs, system, ceph
 
 
 def check_key(target: str, for_check: str) -> bool:
@@ -101,7 +101,7 @@ def parse_args(argv: List[str]):
     server.add_argument("--key", required=True, help="key file path")
     server.add_argument("--api-key", default=None, help="api key file")
     server.add_argument("--api-key-val", help="Json file api key")
-    server.add_argument("--addr", default="0.0.0.0:55443", help="Address to listen on")
+    server.add_argument("--addr", default=f"0.0.0.0:{DEFAULT_PORT}", help="Address to listen on")
 
     subparsers.add_parser('gen_key', help='Generate new key')
 
@@ -116,7 +116,7 @@ def main(argv: List[str]) -> int:
     elif opts.subparser_name == 'gen_key':
         print("Key={}\nenc_key={}".format(*get_key_enc()))
     else:
-        assert False, "Unknown cmd {}".format(opts.subparser_name)
+        assert False, f"Unknown cmd {opts.subparser_name}"
     return 0
 
 

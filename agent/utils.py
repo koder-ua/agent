@@ -1,9 +1,10 @@
 import asyncio
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing.io import BinaryIO
-from typing import Union, Sequence, NamedTuple, Optional, Tuple
+from typing import Union, Sequence, NamedTuple, Optional, Tuple, Any, Callable
 
 logger = logging.getLogger("agent")
 
@@ -12,13 +13,14 @@ CmdType = Union[str, Sequence[Union[str, bytes, Path]]]
 
 
 class CMDResult(NamedTuple):
-    cmd: CmdType
-    out_b: bytes
-    err_b: Optional[bytes]
+    args: CmdType
+    stdout_b: bytes
+    stderr_b: Optional[bytes]
+    returncode: int
 
     @property
-    def out(self) -> str:
-        return self.out_b.decode("utf8")
+    def stdout(self) -> str:
+        return self.stdout_b.decode("utf8")
 
 
 async def run_proc_timeout(cmd: CmdType,
@@ -39,27 +41,28 @@ async def run_proc_timeout(cmd: CmdType,
             if not_done:
                 raise RuntimeError(f"Can't kill process {proc.pid} of {cmd}")
 
-        proc_fut, = done
-        out, err = await proc_fut
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=out, stderr=err)
+        proc_fut2, = done
+        out2, err2 = await proc_fut2
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=out2, stderr=err2)
 
-    proc_fut, = done
-    out, err = await proc_fut
+    proc_fut3, = done
+    out3, err3 = await proc_fut3
 
     if proc.returncode != 0:
         raise subprocess.CalledProcessError(returncode=proc.returncode,
-                                            cmd=cmd, output=out, stderr=err)
+                                            cmd=cmd, output=out3, stderr=err3)
 
-    return CMDResult(cmd, out, err)
+    return CMDResult(cmd, stdout_b=out3, stderr_b=err3, returncode=proc.returncode)
 
 
 async def start_proc(cmd: CmdType,
                      input_data: Union[bytes, None, BinaryIO] = None,
                      merge_err: bool = True,
-                     output_to_devnull: bool = False) -> Tuple[asyncio.subprocess.Process, Optional[bytes]]:
+                     output_to_devnull: bool = False,
+                     dont_remove_pyhome: bool = False) -> Tuple[asyncio.subprocess.Process, Optional[bytes]]:
 
     if isinstance(input_data, bytes):
-        stdin = asyncio.subprocess.PIPE
+        stdin: Any = asyncio.subprocess.PIPE
     elif input_data is None:
         stdin = None
     else:
@@ -74,13 +77,18 @@ async def start_proc(cmd: CmdType,
         stdout = asyncio.subprocess.PIPE
 
     if isinstance(cmd, str):
-        func = asyncio.create_subprocess_shell
+        func: Callable = asyncio.create_subprocess_shell
         cmd = [cmd]
     else:
         func = asyncio.create_subprocess_exec
         cmd = [str(arg) for arg in cmd]
 
-    return (await func(*cmd, stdout=stdout, stderr=stderr, stdin=stdin)), input_data
+    env = os.environ.copy()
+    if not dont_remove_pyhome:
+        if 'PYTHONHOME' in env:
+            del env['PYTHONHOME']
+
+    return (await func(*cmd, stdout=stdout, stderr=stderr, stdin=stdin, env=env)), input_data
 
 
 async def run(cmd: CmdType,
@@ -94,7 +102,7 @@ async def run(cmd: CmdType,
     res = await run_proc_timeout(cmd, proc, timeout=timeout, input_data=input_data, term_timeout=term_timeout)
 
     if merge_err:
-        assert res.err_b is None
+        assert res.stderr_b is None
 
     return res
 

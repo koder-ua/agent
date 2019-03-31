@@ -6,10 +6,7 @@ import struct
 import zlib
 from enum import Enum
 
-from async_generator import async_generator, yield_
-
-from typing import Any, Dict, List, Tuple, Optional, Callable, NamedTuple
-from typing.io import BinaryIO
+from typing import Any, Dict, List, Tuple, Optional, Callable, NamedTuple, AsyncIterator, BinaryIO
 
 exposed = {}
 exposed_async = {}
@@ -94,7 +91,7 @@ class ZlibStreamCompressor(IReadableAsync):
 
 
 def prepare_for_json(args: List, kwargs: Dict) -> Tuple[Dict[str, Any], Optional[IReadableAsync]]:
-    streams = []
+    streams: List[IReadableAsync] = []
     p_args = do_prepare_for_json(args, streams)
     p_kwargs = do_prepare_for_json(kwargs, streams)
     return {'args': p_args, 'kwargs': p_kwargs}, None if streams == [] else streams[0]
@@ -113,7 +110,7 @@ def do_prepare_for_json(val: Any, streams: List[IReadableAsync]) -> Any:
 
     if vt is dict:
         assert all(isinstance(key, str) for key in val)
-        assert CUSTOM_TYPE_KEY not in val, "Can't use {:!r} as key serializable dict".format(CUSTOM_TYPE_KEY)
+        assert CUSTOM_TYPE_KEY not in val, f"Can't use {CUSTOM_TYPE_KEY!r} as key serializable dict"
         return {key: do_prepare_for_json(value, streams) for key, value in val.items()}
 
     if isinstance(val, IReadableAsync):
@@ -121,7 +118,7 @@ def do_prepare_for_json(val: Any, streams: List[IReadableAsync]) -> Any:
         streams.append(val)
         return {CUSTOM_TYPE_KEY: STREAM_TYPE}
 
-    raise TypeError("Can't serialize value of type {}".format(vt))
+    raise TypeError(f"Can't serialize value of type {vt}")
 
 
 def unpack_from_json(data: Dict[str, Any], block_aiter) -> Tuple[str, List, Dict, bool]:
@@ -160,7 +157,7 @@ def do_unpack_from_json(val: Any, streams: List) -> Any:
         elif cctype == BYTES_TYPE:
             return base64.b64decode(val['val'].encode('ascii'))
 
-    raise TypeError("Can't deserialize value of type {}".format(vt))
+    raise TypeError(f"Can't deserialize value of type {vt}")
 
 
 class BlockType(Enum):
@@ -205,14 +202,13 @@ def parse_block_header(header: bytes) -> Block:
                  raw_header=header[hash_digest_size:])
 
 
-def try_parse_block_header(buffer: bytes) -> Tuple[Optional[BinaryIO], bytes]:
+def try_parse_block_header(buffer: bytes) -> Tuple[Optional[Block], bytes]:
     if len(buffer) < block_header_size:
         return None, buffer
 
     return parse_block_header(buffer[:block_header_size]), buffer[block_header_size:]
 
 
-@async_generator
 async def yield_blocks(data_stream):
     buffer = b""
     block: Optional[Block] = None
@@ -232,7 +228,7 @@ async def yield_blocks(data_stream):
 
             block_data = buffer[:block.data_size]
             check_digest(block.raw_header + block_data, block.hash)
-            await yield_((block.tp, block_data))
+            yield block.tp, block_data
 
             buffer = buffer[block.data_size:]
             block = None
@@ -248,19 +244,18 @@ async def yield_blocks(data_stream):
         raise RPCStreamError(f"Stream ends before all data transferred: {buffer}")
 
 
-@async_generator
-async def serialize(name: str, args: List, kwargs: Dict[str, Any]):
-    args, maybe_stream = prepare_for_json(args, kwargs)
-    args['name'] = name
-    serialized_args = json.dumps(args).encode("utf8")
-    await yield_(make_block_header(BlockType.json, serialized_args) + serialized_args)
+async def serialize(name: str, args: List, kwargs: Dict[str, Any]) -> AsyncIterator[bytes]:
+    jargs, maybe_stream = prepare_for_json(args, kwargs)
+    jargs['name'] = name
+    serialized_args = json.dumps(jargs).encode("utf8")
+    yield make_block_header(BlockType.json, serialized_args) + serialized_args
     if maybe_stream is not None:
         while True:
             data = await maybe_stream.readany()
-            assert isinstance(data, bytes), "Stream must yield bytes type, not {}".format(type(data))
+            assert isinstance(data, bytes), f"Stream must yield bytes type, not {type(data)}"
             if data == b'':
                 break
-            await yield_(make_block_header(BlockType.binary, data) + data)
+            yield make_block_header(BlockType.binary, data) + data
 
 
 async def deserialize(data_stream, allow_streamed: bool = False) -> Tuple[str, List, Dict]:
@@ -271,7 +266,7 @@ async def deserialize(data_stream, allow_streamed: bool = False) -> Tuple[str, L
     blocks_iter = yield_blocks(data_stream)
     tp, data = await blocks_iter.__anext__()
     if tp != BlockType.json:
-        raise RPCStreamError("Get block type of {} instead of json".format(tp.name))
+        raise RPCStreamError(f"Get block type of {tp.name} instead of json")
 
     js_data = json.loads(data.decode('utf8'))
     name, args, kwargs, use_stream = unpack_from_json(js_data, blocks_iter)

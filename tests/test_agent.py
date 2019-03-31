@@ -61,7 +61,7 @@ async def test_file_transfer(conn):
             assert tp == BlockType.binary
             data += chunk
         dt = open(fname, 'rb').read()
-        assert data == dt, "{} != {}".format(len(data), len(dt))
+        assert data == dt, f"{len(data)} != {len(dt)}"
 
     async with conn.streamed.fs.get_file(fname, compress=True) as stream:
         data = b""
