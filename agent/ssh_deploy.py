@@ -223,8 +223,6 @@ async def deploy(nodes: List[SSH], arch_file: str, max_parallel_uploads: int, ta
     await asyncio.gather(*map(runner, nodes))
     await enable(nodes)
     await start(nodes)
-    await asyncio.sleep(1)
-    await status(nodes, certs_folder)
 
 
 def parse_args(argv: List[str]) -> Any:

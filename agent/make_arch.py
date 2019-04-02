@@ -6,12 +6,72 @@ import hashlib
 import tempfile
 import argparse
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Any, Set
+from typing import List, Any, Set, Dict
 from distutils.spawn import find_executable
 
 
 EXT_TO_REMOVE = {".c", ".pyi", ".h", '.cpp', '.hpp', '.dist-info', '.pyx', '.pxd'}
+modules_to_remove = ['ensurepip', 'lib2to3', 'venv', 'tkinter']
+
+@dataclass
+class ArchConfig:
+    sources: List[str]
+    remove_files: List[str] = field(default_factory=lambda: EXT_TO_REMOVE.copy())
+    requirements: str = ""
+    version: str = f"{sys.version_info.major}.{sys.version_info.minor}"
+    unpack: str = ""
+    remove_modules: List[str] = field(default_factory=lambda: modules_to_remove[:])
+    remove_pycache: bool = True
+    remove_config: bool = True
+
+
+def load_config(path: Path) -> ArchConfig:
+    attrs: Dict[str, Any] = {}
+    curr_line = ""
+
+    for idx, line in enumerate(path.open()):
+        if '#' in line:
+            line = line.split("#", 1)[0]
+
+        line = line.strip()
+
+        if line == '':
+            continue
+
+        if line.endswith('\\'):
+            curr_line += line + " "
+            continue
+        else:
+            curr_line += line
+
+        if '=' not in curr_line:
+            raise ValueError(f"Syntax error in line {idx} in file {path}. '=' expected in line {curr_line}")
+
+        curr_line = curr_line.strip()
+
+        var, val = curr_line.split("=", 1)
+        var = var.strip()
+        if var in {'sources', 'remove_files', 'remove_modules'}:
+            attrs[var.strip()] = val.split()
+        elif var in {'requirements', 'unpack', 'version'}:
+            attrs[var.strip()] = val.strip()
+        elif var in {'remove_pycache', 'remove_config'}:
+            val = val.strip()
+            if val not in ('True', 'False'):
+                raise ValueError(f"Syntax error at line {idx} in file {path}. " +
+                                 f"Value of {var} can only be 'True' or 'False', not {val}")
+            attrs[var] = val == 'True'
+        else:
+            raise ValueError(f"Syntax error in line {idx} in file {path}. Unknonwn key {var!r}")
+
+        curr_line = ""
+
+    if curr_line != '':
+            raise ValueError(f"Syntax error in file {path}. Extra data at the end ('\\' in the last line?)")
+
+    return ArchConfig(**attrs)
 
 
 def install_deps(target: Path, py_name: str, requirements: Path, libs_dir_name: str):
@@ -29,15 +89,31 @@ def install_deps(target: Path, py_name: str, requirements: Path, libs_dir_name: 
                     fname.unlink()
 
     libs_target = target / libs_dir_name
-    (tempo_libs / 'lib' / py_name / 'site-packages').rename(libs_target)
+    site_packages = tempo_libs / 'lib' / py_name / 'site-packages'
+    if not site_packages.exists():
+        print("No libs installed by pip. If project has no requirements - remove requirements = XXX line from config")
+        exit(1)
+
+    site_packages.rename(libs_target)
     shutil.rmtree(tempo_libs, ignore_errors=True)
 
 
-def copy_code(package_dir: Path, target: Path, root_dir: Path):
-    for name in package_dir.rglob("*.py"):
-        target_fl = target / name.relative_to(root_dir)
-        target_fl.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(name, target_fl)
+def copy_files(root_dir: Path, target: Path, patterns: List[str]):
+    copy_anything = False
+    for pattern in patterns:
+        for name in root_dir.glob(pattern):
+            copy_anything = True
+            target_fl = target / name.relative_to(root_dir)
+            target_fl.parent.mkdir(parents=True, exist_ok=True)
+            if name.is_file():
+                shutil.copyfile(name, target_fl)
+            elif name.is_dir():
+                shutil.copytree(name, target_fl, symlinks=False)
+        print(f"Adding {root_dir}/{pattern} => {len(list(root_dir.glob(pattern)))} files/dirs")
+
+    if not copy_anything:
+        print("Failed: Find nothing to copy to archive")
+        exit(1)
 
 
 def copy_py_binary(py_name: str, bin_target: Path):
@@ -45,19 +121,6 @@ def copy_py_binary(py_name: str, bin_target: Path):
     assert py_path is not None
     shutil.copyfile(py_path, bin_target)
     bin_target.chmod(stat.S_IXUSR | stat.S_IRUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-
-
-def copy_extra(root_dir: Path, target: Path) -> Set[str]:
-    extra_path = root_dir / 'arch_extra.txt'
-    extra = set()
-    if extra_path.is_file():
-        for line in extra_path.open():
-            name = line.strip()
-            if name and not name.startswith("#"):
-                assert '/' not in name
-                shutil.copyfile(str(root_dir / name), str(target / name))
-                extra.add(name)
-    return extra
 
 
 def copy_py_lib(py_name: str, lib_target: Path):
@@ -77,69 +140,83 @@ def copy_py_lib(py_name: str, lib_target: Path):
 
     shutil.copytree(src=str(lib_path), dst=str(lib_target))
 
-    for name in ('ensurepip', 'lib2to3', 'venv', 'tkinter'):
+
+def clear_lib(lib_target: Path, cfg: ArchConfig):
+    for name in cfg.remove_modules:
         tgt = lib_target / name
         if tgt.is_dir():
             shutil.rmtree(tgt)
 
-    for itemname in lib_target.iterdir():
-        if itemname.name.startswith("config-") and itemname.is_dir():
-            shutil.rmtree(itemname)
+    if cfg.remove_config:
+        for itemname in lib_target.iterdir():
+            if itemname.name.startswith("config-") and itemname.is_dir():
+                shutil.rmtree(itemname)
 
-    for pycache_name in lib_target.rglob("__pycache__"):
-        if pycache_name.is_dir():
-            shutil.rmtree(pycache_name)
+    if cfg.remove_pycache:
+        for pycache_name in lib_target.rglob("__pycache__"):
+            if pycache_name.is_dir():
+                shutil.rmtree(pycache_name)
 
 
 def parse_arge(argv: List[str]) -> Any:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--python-version", default=f"{sys.version_info.major}.{sys.version_info.minor}",
-                        help="Path to store archive to")
     parser.add_argument("--standalone", action="store_true",
                         help="Make standalone archive with python interpreter and std library")
-    parser.add_argument("package_path", help="Path to package directory (it parent must contains requirements.txt)")
+    parser.add_argument("--config", default=None, help="Archive config file")
+    parser.add_argument("base_folder", help="Path to package directory (it parent must contains requirements.txt)")
     parser.add_argument("arch_path", help="Path to store self-unpacking archive to")
     return parser.parse_args(argv[1:])
 
 
 def main(argv: List[str]) -> int:
     opts = parse_arge(argv)
-    py_name = f"python{opts.python_version}"
-    package_dir = Path(opts.package_path).absolute()
-    root_dir = package_dir.parent
-    requirements = root_dir / 'requirements.txt'
-    self_unpack_sh = root_dir / 'unpack.sh'
+    root_dir = Path(opts.base_folder).absolute()
+    config = opts.config if opts.config else root_dir / 'arch_config.txt'
+    cfg = load_config(Path(config))
+    py_name = f"python{cfg.version}"
+
+    requirements = root_dir / cfg.requirements if cfg.requirements else None
+    self_unpack_sh = root_dir / cfg.unpack if cfg.unpack else Path(__file__).absolute().parent.parent / 'unpack.sh'
     libs_dir_name = "libs"
 
-    if not requirements.exists():
+    if requirements and not requirements.exists():
         print(f"Can't find requirements at {requirements}")
+        return 1
+
+    if not self_unpack_sh.exists():
+        print(f"Can't find unpack shell file at {self_unpack_sh}")
         return 1
 
     target = Path(tempfile.mkdtemp())
     arch_target = Path(opts.arch_path).absolute()
     temp_arch_target = arch_target.parent / (arch_target.name + ".tmp")
 
-    copy_code(package_dir, target, root_dir)
-    install_deps(target, py_name, requirements, libs_dir_name)
+    copy_files(root_dir, target, cfg.sources)
+
+    if requirements:
+        install_deps(target, py_name, requirements, libs_dir_name)
 
     if opts.standalone:
         standalone_root = target / 'python'
         standalone_root.mkdir(parents=True, exist_ok=True)
         standalone_stdlib = target / 'python' / 'lib' / py_name
         standalone_stdlib.parent.mkdir(parents=True, exist_ok=True)
-
         copy_py_binary(py_name, standalone_root / py_name)
         copy_py_lib(py_name, standalone_stdlib)
+        clear_lib(standalone_stdlib, cfg)
 
-    extra = copy_extra(root_dir, target)
+    if cfg.remove_pycache:
+        for pycache_name in target.rglob("__pycache__"):
+            if pycache_name.is_dir():
+                shutil.rmtree(pycache_name)
 
     tar_cmd = ["tar", "--create", "--gzip", "--directory=" + str(target), "--file", str(temp_arch_target),
-               libs_dir_name, package_dir.name] + list(extra)
+               *(item.name for item in target.iterdir())]
 
     if opts.standalone:
         tar_cmd.append("python")
 
-    assert subprocess.run(tar_cmd).returncode == 0
+    subprocess.run(tar_cmd).check_returncode()
 
     with arch_target.open("wb") as target_fd:
         with temp_arch_target.open("rb") as source_arch:

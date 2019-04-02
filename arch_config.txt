@@ -1,0 +1,7 @@
+sources = agent deploy.sh mirantis_agent.service
+remove_files = *.c *.pyi *.h *.cpp *.hpp *.dist-info *.pyx *.pxd
+requirements = requirements.txt
+version = 3.7
+remove_pycache = True
+remove_config = True
+remove_modules = ensurepip lib2to3 venv tkinter

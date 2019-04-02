@@ -5,9 +5,14 @@ set -o nounset
 
 readonly archname="${0}"
 readonly unpack_folder="${1}"
+
 readonly archbasename=$(basename "${archname}")
-readonly tmpdir=$(mktemp -d)
-readonly arch_content_pos=$(awk '/^__ARCHIVE_BELOW__/ {print NR + 1; exit 0; }' "$0")
+readonly arch_content_pos=$(awk '/^__ARCHIVE_BELOW__/ {print NR + 1; exit 0; }' "${archname}")
+
+if [[ "${unpack_folder}" == "--list" ]] ; then
+    tail "-n+${arch_content_pos}" "${archname}" | tar --gzip --list
+    exit 0
+fi
 
 mkdir --parents "${unpack_folder}"
 tail "-n+${arch_content_pos}" "${archname}" | tar -zx -C "${unpack_folder}"
