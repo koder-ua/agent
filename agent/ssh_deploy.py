@@ -227,7 +227,7 @@ def parse_args(argv: List[str]) -> Any:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     subparsers = parser.add_subparsers(dest='subparser_name')
 
-    deploy_parser = subparsers.add_parser('deploy', help='Deploy')
+    deploy_parser = subparsers.add_parser('install', help='Deploy')
     deploy_parser.add_argument("--max-parallel-uploads", default=0, type=int,
                                help="Max parallel archive uploads to target nodes (default: %(default)s)")
     deploy_parser.add_argument("--arch", metavar='ARCH_FILE',
@@ -240,7 +240,7 @@ def parse_args(argv: List[str]) -> Any:
     status_parser = subparsers.add_parser('status', help='Show daemons statuses')
     stop_parser = subparsers.add_parser('stop', help='Stop daemons')
     start_parser = subparsers.add_parser('start', help='Start daemons')
-    remove_parser = subparsers.add_parser('remove', help='Remove service')
+    remove_parser = subparsers.add_parser('uninstall', help='Remove service')
 
     for sbp in (deploy_parser, start_parser, stop_parser, status_parser, remove_parser):
         sbp.add_argument("inventory", metavar='FILE',
@@ -260,7 +260,7 @@ def main(argv: List[str]) -> int:
     inventory = read_inventory(opts.inventory)
     nodes = [SSH(name_or_ip, ssh_user=opts.ssh_user) for name_or_ip in inventory]
 
-    if opts.subparser_name == 'deploy':
+    if opts.subparser_name == 'install':
         clear_arch = False
         if opts.arch.startswith("http://") or opts.arch.startswith("https://"):
             fd, arch = tempfile.mkstemp(prefix="agent_arch_", suffix=".tar.gz")
@@ -282,7 +282,7 @@ def main(argv: List[str]) -> int:
         asyncio.run(status(nodes, certs_folder=Path(opts.certs_folder)))
     elif opts.subparser_name == 'start':
         asyncio.run(start(nodes))
-    elif opts.subparser_name == 'remove':
+    elif opts.subparser_name == 'uninstall':
         asyncio.run(remove(nodes))
     else:
         assert opts.subparser_name == 'stop', f"Unknown command {opts.subparser_name}"

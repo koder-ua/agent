@@ -39,8 +39,8 @@ function redeploy {
     bash "${ARCH_PATH}" "${INSTALL_TO}"
 
     # redeploy
-    bash "${DEPLOY_SH}" remove "${inventory}"
-    bash "${DEPLOY_SH}" deploy "${inventory}"
+    bash "${DEPLOY_SH}" uninstall "${inventory}"
+    bash "${DEPLOY_SH}" install "${inventory}"
 
     # relink
     #rm -rf "${INSTALL_TO}/agent"
