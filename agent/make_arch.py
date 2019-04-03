@@ -41,7 +41,7 @@ def load_config(path: Path) -> ArchConfig:
             continue
 
         if line.endswith('\\'):
-            curr_line += line + " "
+            curr_line += line[:-1] + " "
             continue
         else:
             curr_line += line
@@ -64,7 +64,7 @@ def load_config(path: Path) -> ArchConfig:
                                  f"Value of {var} can only be 'True' or 'False', not {val}")
             attrs[var] = val == 'True'
         else:
-            raise ValueError(f"Syntax error in line {idx} in file {path}. Unknonwn key {var!r}")
+            raise ValueError(f"Syntax error in line {idx} in file {path}. Unknown key {var!r}")
 
         curr_line = ""
 
@@ -101,7 +101,8 @@ def install_deps(target: Path, py_name: str, requirements: Path, libs_dir_name: 
 def copy_files(root_dir: Path, target: Path, patterns: List[str]):
     copy_anything = False
     for pattern in patterns:
-        for name in root_dir.glob(pattern):
+        names = list(root_dir.glob(pattern))
+        for name in names:
             copy_anything = True
             target_fl = target / name.relative_to(root_dir)
             target_fl.parent.mkdir(parents=True, exist_ok=True)
@@ -109,7 +110,12 @@ def copy_files(root_dir: Path, target: Path, patterns: List[str]):
                 shutil.copyfile(name, target_fl)
             elif name.is_dir():
                 shutil.copytree(name, target_fl, symlinks=False)
-        print(f"Adding {root_dir}/{pattern} => {len(list(root_dir.glob(pattern)))} files/dirs")
+
+        if '*' not in pattern and '?' not in pattern and names == []:
+            print(f"Failed: can't find name {pattern}")
+            exit(1)
+
+        print(f"Adding {root_dir}/{pattern} => {len(names)} files/dirs")
 
     if not copy_anything:
         print("Failed: Find nothing to copy to archive")

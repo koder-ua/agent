@@ -159,9 +159,8 @@ def encrypt_key(key: str, salt: str = None) -> str:
     return hashlib.sha512(key.encode('utf-8') + salt.encode('utf8')).hexdigest() + "::" + salt
 
 
-async def deploy(nodes: List[SSH], arch_file: str, max_parallel_uploads: int, target_folder: str,
+async def deploy(nodes: List[SSH], arch_file: str, max_parallel_uploads: int, target_folder: Path,
                  certs_folder: Path):
-    target_path = Path(target_folder)
 
     upload_semaphore = asyncio.Semaphore(max_parallel_uploads if max_parallel_uploads else len(nodes))
 
@@ -180,12 +179,11 @@ async def deploy(nodes: List[SSH], arch_file: str, max_parallel_uploads: int, ta
         fd.write(api_enc_key)
 
     async def runner(node: SSH):
-        agent_folder = target_path / "agent"
-        node_certs_folder = agent_folder / "certs"
-        service_file = agent_folder / SERVICE_NAME
+        node_certs_folder = target_folder / "certs"
+        service_file = target_folder / SERVICE_NAME
         service_target = f"/lib/systemd/system/{SERVICE_NAME}"
 
-        await node.run(["sudo", "mkdir", "--parents", agent_folder])
+        await node.run(["sudo", "mkdir", "--parents", target_folder])
         await node.run(["sudo", "mkdir", "--parents", AGENT_DATA_PATH])
         assert arch_file.endswith(".tar.gz")
 
@@ -194,9 +192,9 @@ async def deploy(nodes: List[SSH], arch_file: str, max_parallel_uploads: int, ta
         async with upload_semaphore:
             await node.scp(arch_file, temp_arch_file)
 
-        await node.run(["sudo", "tar", "--extract", "--directory=" + str(agent_folder), "--file", temp_arch_file])
-        await node.run(["sudo", "chown", "--recursive", "root.root", agent_folder])
-        await node.run(["sudo", "chmod", "--recursive", "o-w", agent_folder])
+        await node.run(["sudo", "tar", "--extract", "--directory=" + str(target_folder), "--file", temp_arch_file])
+        await node.run(["sudo", "chown", "--recursive", "root.root", target_folder])
+        await node.run(["sudo", "chmod", "--recursive", "o-w", target_folder])
         await node.run(["sudo", "mkdir", "--parents", str(node_certs_folder)])
 
         await node.run(["sudo", "mkdir", "--parents", str(node_certs_folder)])
@@ -236,7 +234,7 @@ def parse_args(argv: List[str]) -> Any:
                                default=str(INSTALL_PATH / 'distribution.tar.gz'),
                                help="Path to file with agent archive (default: %(default)s)")
     deploy_parser.add_argument("--target", metavar='TARGET_FOLDER',
-                               default="/opt/mirantis",
+                               default="/opt/mirantis/agent",
                                help="Path to deploy agent to on target nodes (default: %(default)s)")
 
     status_parser = subparsers.add_parser('status', help='Show daemons statuses')
@@ -249,10 +247,10 @@ def parse_args(argv: List[str]) -> Any:
                          help="Path to file with list of ssh ip/names of ceph nodes")
         sbp.add_argument("--ssh-user", metavar='SSH_USER',
                          default=getpass.getuser(),
-                         help="SSH user")
+                         help="SSH user, (default: %(default)s)")
         sbp.add_argument("--certs-folder", metavar='DIR',
                          default=str(INSTALL_PATH / "agent_client_keys"),
-                         help="Folder to store/read API keys and certificates")
+                         help="Folder to store/read API keys and certificates, (default: %(default)s)")
 
     return parser.parse_args(argv[1:])
 
@@ -273,8 +271,9 @@ def main(argv: List[str]) -> int:
             arch = opts.arch
 
         try:
-            asyncio.run(deploy(nodes, arch, max_parallel_uploads=opts.max_parallel_uploads,
-                               target_folder=opts.target,
+            asyncio.run(deploy(nodes, arch,
+                               max_parallel_uploads=opts.max_parallel_uploads,
+                               target_folder=Path(opts.target),
                                certs_folder=Path(opts.certs_folder)))
         finally:
             if clear_arch:

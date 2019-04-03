@@ -52,4 +52,4 @@ function redeploy {
 }
 
 build "${CONTAINER_ID}" "${AGENT_PATH}" "${ARCH_PATH}"
-redeploy "${2}"
+#redeploy "${2}"
