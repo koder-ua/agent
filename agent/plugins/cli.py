@@ -10,10 +10,9 @@ from typing import List, Optional, Tuple, Dict
 
 from koder_utils import start_proc, run_proc_timeout, CmdType, CMDResult
 
-from . import expose_func, expose_func_async
+from . import expose_func
 
 expose = functools.partial(expose_func, "cli")
-expose_async = functools.partial(expose_func_async, "cli")
 
 
 logger = logging.getLogger("agent.cli")
@@ -24,8 +23,10 @@ last_killall_requested: int = 0
 last_killall_sig: Optional[int] = None
 
 
-DEFAULT_ENVIRON = os.environ
+DEFAULT_ENVIRON = dict(os.environ.items())
 
+
+# return settings for default system python
 if 'ORIGIN_PYTHONHOME' in DEFAULT_ENVIRON:
     DEFAULT_ENVIRON['PYTHONHOME'] = DEFAULT_ENVIRON['ORIGIN_PYTHONHOME']
 
@@ -35,7 +36,7 @@ if 'ORIGIN_PYTHONPATH' in DEFAULT_ENVIRON:
 
 # TODO: make this streaming data from process to caller
 # TODO: how to pass exit code back in this case?
-@expose_async
+@expose
 async def run_cmd(cmd: CmdType,
                   timeout: int = None,
                   input_data: bytes = None,
@@ -43,14 +44,20 @@ async def run_cmd(cmd: CmdType,
                   merge_err: bool = False,
                   output_to_devnull: bool = False,
                   term_timeout: int = 1,
-                  env: Dict[str, str] = None) -> Tuple[int, bytes, bytes]:
+                  env: Dict[str, str] = None,
+                  **kwargs) -> Tuple[int, bytes, bytes]:
 
     start_time = time.time()
 
     if env is None:
         env = DEFAULT_ENVIRON
 
-    proc, input_data = await start_proc(cmd, input_data, merge_err, output_to_devnull, env=env)
+    proc, input_data = await start_proc(cmd, input_data, merge_err, output_to_devnull,
+                                        env=env, preexec_fn=os.setsid, **kwargs)
+    try:
+        group = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        group = None
 
     # there a race between creating of process and killing all processes, fix it
     if start_time < last_killall_requested:
@@ -61,7 +68,9 @@ async def run_cmd(cmd: CmdType,
 
     try:
         res = await run_proc_timeout(cmd, proc, timeout=timeout,
-                                           input_data=input_data, term_timeout=term_timeout)
+                                     input_data=input_data,
+                                     term_timeout=term_timeout,
+                                     term_group=group)
     except subprocess.CalledProcessError as exc:
         res = CMDResult(exc.cmd, stdout_b=exc.stdout, stderr_b=exc.stderr, returncode=exc.returncode)
 
@@ -93,5 +102,5 @@ def killall(signal_num: int = signal.SIGKILL):
 
 
 @expose
-async def environ() -> Dict[str, str]:
+def environ() -> Dict[str, str]:
     return DEFAULT_ENVIRON

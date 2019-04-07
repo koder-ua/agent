@@ -583,7 +583,7 @@ class CephOp:
         offset += cls.I_size + cls.Q_size
         eoffset = offset + cls.I_size * timings_sz
         timings = struct.unpack(">" + "I" * timings_sz, data[offset: eoffset])
-        return cls(pg_id.decode("utf8"), obj_id.decode("utf8"), init_at, None, timings_list=timings), eoffset
+        return cls(pg_id.decode(), obj_id.decode(), init_at, None, timings_list=timings), eoffset
 
     def iter_events(self):
         all_paris = list(zip(self.fixed_stages, self.times)) +  [(self.sub_op_commit, tm) for tm in self.commit_times]
@@ -755,10 +755,10 @@ class CephSensor(ArraysSensor):
         elif metric == 'perf_dump':
             packed = unmerge_strings(data)
             if IS_PYTHON3:
-                return ("[" + ",\n".join(chunk.decode('utf8').strip() for chunk in packed) + "]").encode('utf8')
+                return ("[" + ",\n".join(chunk.decode().strip() for chunk in packed) + "]").encode('utf8')
             return "[" + ",\n".join(chunk.strip() for chunk in packed) + "]"
         else:
-            assert False, "Unknown metric {0!r}".format(metric)
+            assert False, f"Unknown metric {metric!r}"
 
 
 class SensorsData(object):
@@ -911,9 +911,9 @@ def unpack_rpc_updates(res_tuple):
 
     # TODO: data is unpacked/repacked here with no reason
     for sensor_path, (offset, size, typecode) in offset_map.items():
-        sensor_path = sensor_path.decode("utf8")
+        sensor_path = sensor_path.decode()
         sensor_name, device, metric = sensor_path.split('.', 2)
-        units = sensor_units.get("{0}.{1}".format(sensor_name, metric), "")
+        units = sensor_units.get(f"{sensor_name}.{metric}", "")
         if sensor_name == 'ceph' and metric in {'historic', 'perf_dump'}:
             yield sensor_path, CephSensor.split_results(metric, blob[offset:offset + size]), False, units
         else:
@@ -930,9 +930,9 @@ def rpc_start(sensors_config):
     global sdata
 
     if array.array('L').itemsize != 8:
-        message = "Python array.array('L') items should be 8 bytes in size, not {0}." + \
+        message = f"Python array.array('L') items should be 8 bytes in size, not {array.array('L').itemsize}." + \
                   " Can't provide sensors on this platform. Disable sensors in config and retry"
-        raise ValueError(message.format(array.array('L').itemsize))
+        raise ValueError(message)
 
     if sensors_thread is not None:
         raise ValueError("Thread already running")

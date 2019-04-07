@@ -1,7 +1,7 @@
 import errno
 import os
 import json
-import stat
+import traceback
 import zlib
 import shutil
 import os.path
@@ -11,15 +11,15 @@ import functools
 import subprocess
 import distutils.spawn
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator, AsyncIterable
+import stat as stat_module
+from typing import List, Optional, Dict, Any, Tuple, AsyncIterable, Iterator
 
 from koder_utils import run_stdout
 
-from . import expose_func, expose_func_async, IReadableAsync, ChunkedFile, ZlibStreamCompressor, BlockType
+from . import expose_func, IReadableAsync, ChunkedFile, ZlibStreamCompressor, BlockType
 
 
 expose = functools.partial(expose_func, "fs")
-expose_async = functools.partial(expose_func_async, "fs")
 
 
 MAX_FILE_SIZE = 8 * (1 << 20)
@@ -53,20 +53,6 @@ def get_file_no_stream(path: str, compress: bool = True) -> IReadableAsync:
 
 
 @expose
-async def file_stat(path: str) -> Dict[str, Any]:
-    fstat = os.stat(path)
-
-    if stat.S_ISBLK(fstat.st_mode):
-        with open(path, 'rb') as fd:
-            fd.seek(os.SEEK_END, 0)
-            size = fd.tell()
-    else:
-        size = fstat.st_size
-
-    return {"size": size}
-
-
-@expose_async
 async def write_file(path: Optional[str], content: AsyncIterable[Tuple[BlockType, bytes]],
                      compress: bool = False) -> str:
     if path is None:
@@ -109,18 +95,12 @@ def unlink(path: str):
     os.unlink(path)
 
 
-@expose_async
+@expose
 async def which(name: str) -> Optional[str]:
     try:
         return await run_stdout(["which", name])
     except subprocess.CalledProcessError:
         return None
-
-
-@expose_async
-async def get_dev_for_file(fname: str) -> str:
-    dev_link = (await run_stdout(["df", fname])).strip().split("\n")[1].split()[0]
-    return str(Path(fname if dev_link == 'udev' else dev_link).resolve())
 
 
 def fall_down(node: Dict, root: str, res_dict: Dict[str, str]):
@@ -147,18 +127,33 @@ def follow_symlink(fname: str) -> str:
     return fname
 
 
-@expose_async
-async def get_dev_for_file2(fname: str) -> str:
-    fname = os.path.abspath(fname)
-    fname = follow_symlink(fname)
-    mp_map = await get_mountpoint_to_dev_mapping()
+async def get_mounts() -> Dict[str, Tuple[str, str]]:
+    lsblk = json.loads(await run_stdout("lsblk --json"))
 
-    while True:
-        if fname in mp_map:
-            return '/dev/' + mp_map[fname]
-        assert fname != '/', f"Can't found dev for {fname}"
-        fname = os.path.dirname(fname)
-        fname = follow_symlink(fname)
+    def iter_mounts(curr: List[Dict[str, Any]], parent_device: str = None) -> Iterator[Tuple[str, str, str]]:
+        for dev_info in curr:
+            name = parent_device if parent_device else dev_info["name"]
+            if dev_info.get("mountpoint") is not None:
+                yield name, dev_info["name"], dev_info["mountpoint"]
+
+            if 'children' in dev_info:
+                yield from iter_mounts(dev_info['children'], name)
+
+    return {mp: ('/dev/' + dev,  '/dev/' + partition) for dev, partition, mp in iter_mounts(lsblk["blockdevices"])}
+
+
+def find_mount_point(path: Path) -> Path:
+    path = path.resolve()
+    while not os.path.ismount(path):
+        assert str(path) != '/'
+        path = path.parent
+    return path
+
+
+@expose
+async def get_dev_and_partition(fname: str) -> Tuple[str, str]:
+    mounts = await get_mounts()
+    return mounts[str(find_mount_point(Path(fname)))]
 
 
 @expose
@@ -167,11 +162,14 @@ def binarys_exists(names: List[str]) -> List[str]:
 
 
 @expose
-def find_pids_for_cmd(bname: str) -> List[int]:
-    bin_path = distutils.spawn.find_executable(bname)
+def find_pids_for_cmd(bname: str, find_binary: bool = True) -> List[int]:
+    bin_path = distutils.spawn.find_executable(bname) if find_binary else bname
 
     if not bin_path:
         raise NameError(f"Can't found binary path for {bname!r}")
+
+    # follow all symlinks & other
+    bin_path = str(Path(bin_path).resolve())
 
     res = []
     for name in os.listdir('/proc'):
@@ -194,7 +192,7 @@ def get_block_devs_info(filter_virtual: bool = True) -> Dict[str, Tuple[bool, st
                 continue
             res[name] = (
                 open(rot_fl).read().strip() == 1,
-                open(sched_fl).read()
+                open(sched_fl).read().strip()
             )
     return res
 
@@ -212,9 +210,9 @@ def stat_all(paths: List[str]) -> List[List[int]]:
 @expose
 def count_sockets_for_process(pid: int) -> int:
     count = 0
-    for fd in os.listdir('/proc/{0}/fd'.format(pid)):
+    for fd in os.listdir(f'/proc/{pid}/fd'):
         try:
-            if stat.S_ISSOCK(os.stat('/proc/{0}/fd/{1}'.format(pid, fd)).st_mode):
+            if stat_module.S_ISSOCK(os.stat(f'/proc/{pid}/fd/{fd}').st_mode):
                 count += 1
         except OSError as exc:
             if exc.errno != errno.ENOENT:

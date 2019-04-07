@@ -3,14 +3,15 @@ import sys
 import http
 import argparse
 import traceback
+import subprocess
+import logging.config
 from typing import List, Dict, Any
 
 from aiohttp import web, BasicAuth
 
 from .plugins import DEFAULT_HTTP_CHUNK, exposed, exposed_async
-from . import rpc
+from . import rpc, USER_NAME, MAX_FILE_SIZE, DEFAULT_PORT
 from .ssh_deploy import get_key_enc, encrypt_key
-from . import USER_NAME, MAX_FILE_SIZE, DEFAULT_PORT
 
 
 def check_key(target: str, for_check: str) -> bool:
@@ -46,7 +47,12 @@ class RPCRequest:
 async def send_body(is_ok: bool, result: Any, writer):
 
     if not is_ok:
-        result = result.__class__.__name__, str(result), traceback.format_exc()
+        if isinstance(result, subprocess.TimeoutExpired):
+            args = (result.cmd, result.timeout, result.stdout, result.stderr)
+        else:
+            args = result.args
+
+        result = result.__class__.__name__, args, traceback.format_exc()
 
     async for chunk in rpc.serialize(rpc.CALL_SUCCEEDED if is_ok else rpc.CALL_FAILED, [result], {}):
         await writer.write(chunk)
@@ -106,9 +112,40 @@ def parse_args(argv: List[str]):
     return p.parse_args(argv[1:])
 
 
+log_config = {
+    "version": 1,
+    "disable_existing_loggers": True,
+    "formatters": {
+        "simple": {
+            "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            "datefmt": "%H:%M:%S"
+        }
+    },
+    "handlers": {
+        "console": {
+            "level": "DEBUG",
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+            "stream"  : "ext://sys.stdout"
+        },
+    },
+    "loggers": {
+        "cmd":     {"level": "DEBUG", "handlers": ["console"]},
+        "storage": {"level": "DEBUG", "handlers": ["console"]},
+        "rpc":     {"level": "DEBUG", "handlers": ["console"]},
+        "cephlib": {"level": "DEBUG", "handlers": ["console"]},
+        "collect": {"level": "DEBUG", "handlers": ["console"]},
+        "agent":   {"level": "DEBUG", "handlers": ["console"]},
+        "report":  {"level": "DEBUG", "handlers": ["console"]},
+        "index":   {"level": "DEBUG", "handlers": ["console"]}
+    }
+}
+
+
 def main(argv: List[str]) -> int:
     opts = parse_args(argv)
     if opts.subparser_name == 'server':
+        logging.config.dictConfig(log_config)
         api_key = opts.api_key_val if opts.api_key is None else open(opts.api_key).read()
         start_rpc_server(opts.addr, opts.cert, opts.key, api_key)
     elif opts.subparser_name == 'gen_key':

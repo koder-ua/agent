@@ -1,11 +1,10 @@
 import logging
 import functools
 
-from . import expose_func, expose_func_async
+from . import expose_func
 
 
 expose = functools.partial(expose_func, "sys")
-expose_async = functools.partial(expose_func_async, "sys")
 
 
 logger = logging.getLogger("agent.fs")

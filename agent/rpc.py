@@ -194,7 +194,7 @@ async def deserialize(data_stream: AsyncIterable[bytes], allow_streamed: bool = 
     if tp != BlockType.json:
         raise RPCStreamError(f"Get block type of {tp.name} instead of json")
 
-    js_data = json.loads(data.decode('utf8'))
+    js_data = json.loads(data.decode())
     name, args, kwargs, use_stream = unpack_from_json(js_data, blocks_iter)
 
     if use_stream:

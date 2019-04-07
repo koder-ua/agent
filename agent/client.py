@@ -28,7 +28,7 @@ exc_list = [BaseException, SystemExit, KeyboardInterrupt, GeneratorExit, Excepti
             AttributeError, EnvironmentError, IOError, OSError, EOFError, ImportError, LookupError, IndexError,
             KeyError, MemoryError, NameError, UnboundLocalError, ReferenceError, RuntimeError, NotImplementedError,
             SystemError, TypeError, ValueError, UnicodeError, UnicodeDecodeError, UnicodeEncodeError,
-            UnicodeTranslateError, subprocess.CalledProcessError]
+            FileNotFoundError, UnicodeTranslateError, subprocess.CalledProcessError, subprocess.TimeoutExpired]
 
 
 exc_map = {exc.__name__: exc for exc in exc_list}
@@ -42,10 +42,10 @@ async def process_rpc_results(resp: aiohttp.ClientResponse, allow_streamed: bool
     assert kwargs == {}
     assert len(data) == 1
     if name == CALL_FAILED:
-        exc_cls_name, message, tb = data[0]
+        exc_cls_name, args, tb = data[0]
         if exc_cls_name == 'TypeError':
             traceback.print_stack()
-        exc = exc_map.get(exc_cls_name, Exception)(message)
+        exc = exc_map.get(exc_cls_name, Exception)(*args)
         raise exc from Exception("RPC server traceback:\n" + tb)
     else:
         assert name == CALL_SUCCEEDED
