@@ -1,12 +1,11 @@
 import logging
 import functools
-from typing import List
 
-from .. import rpc
+from . import expose_func, expose_func_async
 
 
-expose = functools.partial(rpc.expose_func, "sys")
-expose_async = functools.partial(rpc.expose_func_async, "sys")
+expose = functools.partial(expose_func, "sys")
+expose_async = functools.partial(expose_func_async, "sys")
 
 
 logger = logging.getLogger("agent.fs")

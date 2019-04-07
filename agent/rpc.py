@@ -1,93 +1,27 @@
-import abc
 import base64
 import hashlib
 import json
 import struct
-import zlib
-from enum import Enum
 
-from typing import Any, Dict, List, Tuple, Optional, Callable, NamedTuple, AsyncIterator, BinaryIO
+from typing import Any, Dict, List, Tuple, Optional, NamedTuple, AsyncIterator, AsyncIterable
 
-exposed = {}
-exposed_async = {}
+from .plugins import IReadableAsync, BlockType
+
 
 EOD_MARKER = b'\x00'
 CUSTOM_TYPE_KEY = '__custom__type_658aaae5-6216-4fe0-8483-d51cf21a6ba5'
 STREAM_TYPE = 'binary_stream'
 BYTES_TYPE = 'bytes'
 
-DEFAULT_CHUNK = 1 << 20
-
 # use string instead of int to unify call and return code
 CALL_FAILED = 'fail'
 CALL_SUCCEEDED = 'success'
-
-
-def validate_name(name: str):
-    assert not name.startswith("_")
-    assert name != 'streamed'
-
-
-def expose_func(module: str, func: Callable):
-    validate_name(module)
-    validate_name(func.__name__)
-    exposed[module + "::" + func.__name__] = func
-    return func
-
-
-def expose_func_async(module: str, func: Callable):
-    validate_name(module)
-    validate_name(func.__name__)
-    exposed_async[module + "::" + func.__name__] = func
-    return func
 
 
 # async stream classes
 
 class RPCStreamError(Exception):
     pass
-
-
-class IReadableAsync:
-    @abc.abstractmethod
-    async def readany(self) -> bytes:
-        pass
-
-
-class ChunkedFile(IReadableAsync):
-    def __init__(self, fd: BinaryIO, chunk: int = DEFAULT_CHUNK) -> None:
-        self.fd = fd
-        self.chunk = chunk
-
-    async def readany(self) -> bytes:
-        if self.fd.closed:
-            return b""
-
-        data = self.fd.read(self.chunk)
-        if not data:
-            self.fd.close()
-        return data
-
-
-class ZlibStreamCompressor(IReadableAsync):
-
-    def __init__(self, fd: IReadableAsync) -> None:
-        self.fd = fd
-        self.compressor = zlib.compressobj()
-        self.eof = False
-
-    async def readany(self) -> bytes:
-        if self.eof:
-            return b''
-
-        res = b''
-        while not res:
-            data = await self.fd.readany()
-            if data == b'':
-                self.eof = True
-                return res + self.compressor.flush()
-            res += self.compressor.compress(data)
-        return res
 
 
 def prepare_for_json(args: List, kwargs: Dict) -> Tuple[Dict[str, Any], Optional[IReadableAsync]]:
@@ -160,11 +94,6 @@ def do_unpack_from_json(val: Any, streams: List) -> Any:
     raise TypeError(f"Can't deserialize value of type {vt}")
 
 
-class BlockType(Enum):
-    json = 1
-    binary = 2
-
-
 block_header_struct = struct.Struct("!BL")
 hash_factory = hashlib.md5
 hash_digest_size = hash_factory().digest_size
@@ -209,12 +138,11 @@ def try_parse_block_header(buffer: bytes) -> Tuple[Optional[Block], bytes]:
     return parse_block_header(buffer[:block_header_size]), buffer[block_header_size:]
 
 
-async def yield_blocks(data_stream):
+async def yield_blocks(data_stream: AsyncIterable[bytes]) -> AsyncIterator[Tuple[BlockType, bytes]]:
     buffer = b""
     block: Optional[Block] = None
 
-    while True:
-        new_chunk = await data_stream.readany()
+    async for new_chunk in data_stream:
         buffer += new_chunk
 
         # while we have enought data to produce new blocks
@@ -250,19 +178,17 @@ async def serialize(name: str, args: List, kwargs: Dict[str, Any]) -> AsyncItera
     serialized_args = json.dumps(jargs).encode("utf8")
     yield make_block_header(BlockType.json, serialized_args) + serialized_args
     if maybe_stream is not None:
-        while True:
-            data = await maybe_stream.readany()
+        async for data in maybe_stream:
             assert isinstance(data, bytes), f"Stream must yield bytes type, not {type(data)}"
             if data == b'':
                 break
             yield make_block_header(BlockType.binary, data) + data
 
 
-async def deserialize(data_stream, allow_streamed: bool = False) -> Tuple[str, List, Dict]:
+async def deserialize(data_stream: AsyncIterable[bytes], allow_streamed: bool = False) -> Tuple[str, List, Dict]:
     """
     Unpack request from aiohttp.StreamReader or compatible stream
     """
-
     blocks_iter = yield_blocks(data_stream)
     tp, data = await blocks_iter.__anext__()
     if tp != BlockType.json:
@@ -275,6 +201,7 @@ async def deserialize(data_stream, allow_streamed: bool = False) -> Tuple[str, L
         if not allow_streamed:
             raise ValueError("Streaming not allowed for this call")
     else:
+        # check that no data left
         try:
             await blocks_iter.__anext__()
         except StopAsyncIteration:

@@ -7,12 +7,10 @@ from typing import List, Dict, Any
 
 from aiohttp import web, BasicAuth
 
+from .plugins import DEFAULT_HTTP_CHUNK, exposed, exposed_async
 from . import rpc
 from .ssh_deploy import get_key_enc, encrypt_key
-from .common import USER_NAME, MAX_FILE_SIZE, DEFAULT_PORT
-
-# import all plugins to register handlers
-from .plugins import cli, fs, system, ceph
+from . import USER_NAME, MAX_FILE_SIZE, DEFAULT_PORT
 
 
 def check_key(target: str, for_check: str) -> bool:
@@ -55,14 +53,14 @@ async def send_body(is_ok: bool, result: Any, writer):
 
 
 async def handle_post(request: web.Request):
-    req = RPCRequest(*(await rpc.deserialize(request.content)))
-    responce = web.StreamResponse(status=http.HTTPStatus.OK)
+    req = RPCRequest(*(await rpc.deserialize(request.content.iter_chunked(DEFAULT_HTTP_CHUNK), allow_streamed=True)))
+    responce = web.StreamResponse(status=http.HTTPStatus.OK, headers={'Content-Encoding': 'identity'})
     await responce.prepare(request)
     try:
-        if req.func_name in rpc.exposed_async:
-            res = await rpc.exposed_async[req.func_name](*req.args, **req.kwargs)
+        if req.func_name in exposed_async:
+            res = await exposed_async[req.func_name](*req.args, **req.kwargs)
         else:
-            res = rpc.exposed[req.func_name](*req.args, **req.kwargs)
+            res = exposed[req.func_name](*req.args, **req.kwargs)
     except Exception as exc:
         await send_body(False, exc, responce)
     else:
@@ -84,7 +82,7 @@ def start_rpc_server(addr: str, ssl_cert: str, ssl_key: str, api_key: str):
 
     auth = basic_auth_middleware(api_key)
     app = web.Application(middlewares=[auth], client_max_size=MAX_FILE_SIZE)
-    app.add_routes([web.post('/rpc', handle_post)])
+    app.add_routes([web.post('/conn', handle_post)])
     app.add_routes([web.get('/ping', handle_ping)])
 
     host, port = addr.split(":")

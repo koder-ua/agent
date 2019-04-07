@@ -1,3 +1,4 @@
+import os
 import zlib
 import time
 import signal
@@ -5,13 +6,15 @@ import asyncio
 import logging
 import functools
 import subprocess
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple, Dict
 
-from .. import rpc
-from .. import utils
+from koder_utils import start_proc, run_proc_timeout, CmdType, CMDResult
 
-expose = functools.partial(rpc.expose_func, "cli")
-expose_async = functools.partial(rpc.expose_func_async, "cli")
+from . import expose_func, expose_func_async
+
+expose = functools.partial(expose_func, "cli")
+expose_async = functools.partial(expose_func_async, "cli")
+
 
 logger = logging.getLogger("agent.cli")
 
@@ -21,19 +24,33 @@ last_killall_requested: int = 0
 last_killall_sig: Optional[int] = None
 
 
+DEFAULT_ENVIRON = os.environ
+
+if 'ORIGIN_PYTHONHOME' in DEFAULT_ENVIRON:
+    DEFAULT_ENVIRON['PYTHONHOME'] = DEFAULT_ENVIRON['ORIGIN_PYTHONHOME']
+
+if 'ORIGIN_PYTHONPATH' in DEFAULT_ENVIRON:
+    DEFAULT_ENVIRON['PYTHONHOME'] = DEFAULT_ENVIRON['ORIGIN_PYTHONPATH']
+
+
 # TODO: make this streaming data from process to caller
 # TODO: how to pass exit code back in this case?
 @expose_async
-async def run_cmd(cmd: utils.CmdType,
+async def run_cmd(cmd: CmdType,
                   timeout: int = None,
                   input_data: bytes = None,
                   compress: bool = True,
                   merge_err: bool = False,
                   output_to_devnull: bool = False,
-                  term_timeout: int = 1) -> Tuple[int, bytes, bytes]:
+                  term_timeout: int = 1,
+                  env: Dict[str, str] = None) -> Tuple[int, bytes, bytes]:
 
     start_time = time.time()
-    proc, input_data = await utils.start_proc(cmd, input_data, merge_err, output_to_devnull)
+
+    if env is None:
+        env = DEFAULT_ENVIRON
+
+    proc, input_data = await start_proc(cmd, input_data, merge_err, output_to_devnull, env=env)
 
     # there a race between creating of process and killing all processes, fix it
     if start_time < last_killall_requested:
@@ -43,10 +60,10 @@ async def run_cmd(cmd: utils.CmdType,
     all_procs.append(proc)
 
     try:
-        res = await utils.run_proc_timeout(cmd, proc, timeout=timeout,
+        res = await run_proc_timeout(cmd, proc, timeout=timeout,
                                            input_data=input_data, term_timeout=term_timeout)
     except subprocess.CalledProcessError as exc:
-        res = utils.CMDResult(exc.cmd, stdout_b=exc.stdout, stderr_b=exc.stderr, returncode=exc.returncode)
+        res = CMDResult(exc.cmd, stdout_b=exc.stdout, stderr_b=exc.stderr, returncode=exc.returncode)
 
     if compress:
         out = zlib.compress(res.stdout_b)
@@ -73,3 +90,8 @@ def killall(signal_num: int = signal.SIGKILL):
             proc.send_signal(signal_num)
         except:
             pass
+
+
+@expose
+async def environ() -> Dict[str, str]:
+    return DEFAULT_ENVIRON

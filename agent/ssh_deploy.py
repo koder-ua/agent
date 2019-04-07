@@ -2,89 +2,45 @@ import re
 import os
 import ssl
 import sys
-import traceback
 import uuid
 import os.path
 import asyncio
 import getpass
 import hashlib
 import argparse
-import tempfile
 import subprocess
-import urllib.request
 from pathlib import Path
 from typing import List, Tuple, Any
 
 import aiohttp
 
-from . import utils
+from koder_utils import SSH, read_inventory, make_secure, make_cert_and_key
+
+from .client import AsyncRPCClient, RPCServerFailure
 
 
 SERVICE_NAME = "mirantis_agent.service"
 AGENT_DATA_PATH = Path("/var/mirantis/agent")
-INSTALL_PATH = Path(__file__).resolve().parent.parent
-
-
-DEFAULT_OPTS = ("-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectionAttempts=3",
-                "-o", "ConnectTimeout=10",
-                "-o", "LogLevel=ERROR")
-
-
-class SSH:
-    def __init__(self, node: str, ssh_user: str, ssh_opts: Tuple[str, ...] = DEFAULT_OPTS) -> None:
-        self.node = node
-        self.ssh_opts = list(ssh_opts)
-        self.ssh_user = ssh_user
-        self.cmd_prefix = ["ssh"] + self.ssh_opts + [self.ssh_user + "@" + self.node] + ['--']
-        self.cmd_prefix_s = " ".join(self.cmd_prefix) + " "
-
-    async def run(self, cmd: utils.CmdType, *args, **kwargs) -> utils.CMDResult:
-        cmd = (self.cmd_prefix if isinstance(cmd, list) else self.cmd_prefix_s) + cmd  # type: ignore
-        return await utils.run(cmd, *args, **kwargs)
-
-    async def scp(self, source: str, target: str, timeout: int = 60):
-        cmd = ["scp", *self.ssh_opts, source, f"{self.ssh_user}@{self.node}:{target}"]
-        await utils.run(cmd, timeout=timeout)
-
-
-def make_secure(*files: Path):
-    for fl in files:
-        if fl.exists():
-            fl.unlink()
-        os.close(os.open(str(fl), os.O_WRONLY | os.O_CREAT, 0o600))
-
-
-async def make_cert_and_key(key_file: Path, cert_file: Path, subj: str):
-    await utils.run(f"openssl genrsa 1024 2>/dev/null > {key_file}")
-    cmd = f'openssl req -new -x509 -nodes -sha1 -days 365 -key "{key_file}" -subj "{subj}" > {cert_file} 2>/dev/null'
-    await utils.run(cmd)
-
-
-def read_inventory(path: str) -> List[str]:
-    names = [name_or_ip.strip() for name_or_ip in open(path)]
-    return [name_or_ip for name_or_ip in names if name_or_ip and not name_or_ip.startswith("#")]
+LOCAL_INSTALL_PATH = Path(__file__).resolve().parent.parent
 
 
 async def stop(nodes: List[SSH]):
-    await asyncio.gather(*[node.run(f"sudo systemctl stop {SERVICE_NAME}") for node in nodes])
+    await asyncio.gather(*[node.run(["sudo", "systemctl", "stop", SERVICE_NAME]) for node in nodes])
 
 
 async def disable(nodes: List[SSH]):
-    await asyncio.gather(*[node.run(f"sudo systemctl disable {SERVICE_NAME}") for node in nodes])
+    await asyncio.gather(*[node.run(["sudo", "systemctl", "disable", SERVICE_NAME]) for node in nodes])
 
 
 async def enable(nodes: List[SSH]):
-    await asyncio.gather(*[node.run(f"sudo systemctl enable {SERVICE_NAME}") for node in nodes])
+    await asyncio.gather(*[node.run(["sudo", "systemctl", "enable", SERVICE_NAME]) for node in nodes])
 
 
 async def start(nodes: List[SSH]):
-    await asyncio.gather(*[node.run(f"sudo systemctl start {SERVICE_NAME}") for node in nodes])
+    await asyncio.gather(*[node.run(["sudo", "systemctl", "start", SERVICE_NAME]) for node in nodes])
 
 
 async def status(nodes: List[SSH], certs_folder: Path):
-    from .client import AsyncRPCClient, RPCServerFailure
 
     key_path = certs_folder / 'agent_api.key'
     if not key_path.is_file():
@@ -180,8 +136,6 @@ async def deploy(nodes: List[SSH], arch_file: str, max_parallel_uploads: int, ta
 
     async def runner(node: SSH):
         node_certs_folder = target_folder / "certs"
-        service_file = target_folder / SERVICE_NAME
-        service_target = f"/lib/systemd/system/{SERVICE_NAME}"
 
         await node.run(["sudo", "mkdir", "--parents", target_folder])
         await node.run(["sudo", "mkdir", "--parents", AGENT_DATA_PATH])
@@ -190,7 +144,7 @@ async def deploy(nodes: List[SSH], arch_file: str, max_parallel_uploads: int, ta
         temp_arch_file = f"/tmp/mirantis_agent_{uuid.uuid1()!s}.tar.gz"
 
         async with upload_semaphore:
-            await node.scp(arch_file, temp_arch_file)
+            await node.copy(arch_file, temp_arch_file)
 
         await node.run(["sudo", "tar", "--extract", "--directory=" + str(target_folder), "--file", temp_arch_file])
         await node.run(["sudo", "chown", "--recursive", "root.root", target_folder])
@@ -206,16 +160,24 @@ async def deploy(nodes: List[SSH], arch_file: str, max_parallel_uploads: int, ta
         await make_cert_and_key(ssl_key_file, ssl_cert_file,
                                 f"/C=NN/ST=Some/L=Some/O=agent/OU=agent/CN={node.node}")
 
-        ssl_cert = ssl_cert_file.open("rb").read()
-        await node.run(["sudo", "tee", str(node_certs_folder / "ssl_cert.cert")], input_data=ssl_cert)
+        target_cert_path = str(node_certs_folder / "ssl_cert.cert")
+        target_key_path = str(node_certs_folder / "ssl_cert.key")
+        target_api_key_path = str(node_certs_folder / "api.key")
 
-        ssl_key = ssl_key_file.open("rb").read()
-        await node.run(["sudo", "tee", str(node_certs_folder / "ssl_cert.key")], input_data=ssl_key)
-
-        await node.run(["sudo", "tee", str(node_certs_folder / "api.key")], input_data=api_enc_key.encode("utf8"))
+        await node.run(["sudo", "tee", target_cert_path], input_data=ssl_cert_file.open("rb").read())
+        await node.run(["sudo", "tee", target_key_path], input_data=ssl_key_file.open("rb").read())
+        await node.run(["sudo", "tee", target_api_key_path], input_data=api_enc_key.encode("utf8"))
 
         await node.run(["rm", temp_arch_file])
-        await node.run(["sudo", "cp", service_file, service_target])
+
+        service_content = (LOCAL_INSTALL_PATH / (SERVICE_NAME + "_template")).open().read()
+
+        service_content = service_content.replace("{INSTALL}", str(target_folder)) \
+            .replace("{CERT_PATH}", target_cert_path) \
+            .replace("{KEY_PATH}", target_key_path) \
+            .replace("{API_KEY_PATH}", target_api_key_path)
+
+        await node.run(["sudo", "tee", f"/lib/systemd/system/{SERVICE_NAME}"], input_data=service_content)
         await node.run(["sudo", "systemctl", "daemon-reload"])
 
     await asyncio.gather(*map(runner, nodes))
@@ -231,7 +193,7 @@ def parse_args(argv: List[str]) -> Any:
     deploy_parser.add_argument("--max-parallel-uploads", default=0, type=int,
                                help="Max parallel archive uploads to target nodes (default: %(default)s)")
     deploy_parser.add_argument("--arch", metavar='ARCH_FILE',
-                               default=str(INSTALL_PATH / 'distribution.tar.gz'),
+                               default=str(LOCAL_INSTALL_PATH / 'distribution.tar.gz'),
                                help="Path to file with agent archive (default: %(default)s)")
     deploy_parser.add_argument("--target", metavar='TARGET_FOLDER',
                                default="/opt/mirantis/agent",
@@ -249,7 +211,7 @@ def parse_args(argv: List[str]) -> Any:
                          default=getpass.getuser(),
                          help="SSH user, (default: %(default)s)")
         sbp.add_argument("--certs-folder", metavar='DIR',
-                         default=str(INSTALL_PATH / "agent_client_keys"),
+                         default=str(LOCAL_INSTALL_PATH / "agent_client_keys"),
                          help="Folder to store/read API keys and certificates, (default: %(default)s)")
 
     return parser.parse_args(argv[1:])
@@ -262,22 +224,15 @@ def main(argv: List[str]) -> int:
 
     if opts.subparser_name == 'install':
         clear_arch = False
-        if opts.arch.startswith("http://") or opts.arch.startswith("https://"):
-            fd, arch = tempfile.mkstemp(prefix="agent_arch_", suffix=".tar.gz")
-            os.close(fd)
-            urllib.request.urlretrieve(opts.arch, arch)
-            clear_arch = True
-        else:
-            arch = opts.arch
 
         try:
-            asyncio.run(deploy(nodes, arch,
+            asyncio.run(deploy(nodes, opts.arch,
                                max_parallel_uploads=opts.max_parallel_uploads,
                                target_folder=Path(opts.target),
                                certs_folder=Path(opts.certs_folder)))
         finally:
             if clear_arch:
-                os.unlink(arch)
+                os.unlink(opts.arch)
     elif opts.subparser_name == 'status':
         asyncio.run(status(nodes, certs_folder=Path(opts.certs_folder)))
     elif opts.subparser_name == 'start':

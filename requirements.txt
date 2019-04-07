@@ -1,1 +1,2 @@
 aiohttp>=3.0.0,<4.0.0
+git+https://github.com/koder-ua/koder_utils.git@master

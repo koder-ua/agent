@@ -6,10 +6,10 @@ set -o nounset
 
 readonly AGENT_PATH=$(dirname $(realpath "${0}"))
 readonly CONTAINER_ID="${1}"
+readonly INSTALL_TO="${2}"
+readonly INVENTORY="${3}"
 
-readonly INSTALL_TO="/opt/mirantis/agent"
 readonly ARCH_PATH="${AGENT_PATH}/arch/agent.sh"
-readonly DEPLOY_SH="${INSTALL_TO}/deploy.sh"
 
 
 function build {
@@ -32,24 +32,24 @@ function build {
 
 
 function redeploy {
-    local -r inventory="${1}"
+    local -r install_path="${1}"
+    local -r inventory="${2}"
+    local -r arch_path="${3}"
+
+    local -r deploy_cmd="${install_path}/run.sh ssh_deploy"
 
     # install locally
-    rm -rf "${INSTALL_TO}"
-    bash "${ARCH_PATH}" "${INSTALL_TO}"
+    rm -rf "${install_path}"
+    bash "${arch_path}" "${install_path}"
 
     # redeploy
-    bash "${DEPLOY_SH}" uninstall "${inventory}"
-    bash "${DEPLOY_SH}" install "${inventory}"
-
-    # relink
-    #rm -rf "${INSTALL_TO}/agent"
-    #ln -s "${AGENT_PATH}" "${INSTALL_TO}/agent"
+    bash "${deploy_cmd}" uninstall "${inventory}"
+    bash "${deploy_cmd}" install "${inventory}"
 
     # show status
     sleep 1
-    bash "${DEPLOY_SH}" status --certs-folder "${INSTALL_TO}/agent_client_keys" "${inventory}"
+    bash "${deploy_cmd}" status --certs-folder "${install_path}/agent_client_keys" "${inventory}"
 }
 
 build "${CONTAINER_ID}" "${AGENT_PATH}" "${ARCH_PATH}"
-#redeploy "${2}"
+redeploy "${INSTALL_TO}" "${INVENTORY}" "${ARCH_PATH}"
