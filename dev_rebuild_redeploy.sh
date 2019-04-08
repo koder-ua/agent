@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-set -x
 set -o errexit
 set -o pipefail
 set -o nounset
 
+
+if [[ "${1:-}" == "--help" ]] || [[ "${1:-}" == "-h" ]] ; then
+    echo "Usage: ${0} BUILD_CONTAINER_ID LOCAL_INSTALL_FOLDER INVENTORY_FILE"
+    exit 0
+fi
+
 readonly AGENT_PATH=$(dirname $(realpath "${0}"))
+readonly MAKE_ARCH_LIB=$(python -c "import koder_utils ; print(koder_utils.__file__)")
+readonly MAKE_ARCH_LIB_PATH=$(dirname $(realpath "${MAKE_ARCH_LIB}"))
 readonly CONTAINER_ID="${1}"
-readonly INSTALL_TO="${2}"
-readonly INVENTORY="${3}"
+readonly DEPLOY_RUN_FOLDER=/tmp
 
 readonly ARCH_PATH="${AGENT_PATH}/arch/agent.sh"
 
@@ -15,15 +21,17 @@ readonly ARCH_PATH="${AGENT_PATH}/arch/agent.sh"
 function build {
     local -r container="${1}"
     local -r agent_path="${2}"
-    local -r arch_path="${3}"
+    local -r libpath="${3}"
+    local -r arch_path="${4}"
 
     local -r copy_to="/tmp/agent"
     local -r in_container_arch="/tmp/agent.sh"
 
     docker exec -it "${container}" rm -rf "${copy_to}"
     docker cp "${agent_path}" "${container}:${copy_to}"
+    docker cp "${libpath}" "${container}:${copy_to}"
 
-    local cmd="python3.7 -m agent.make_arch --config ${copy_to}/arch_config.txt "
+    local cmd="python3.7 -m koder_utils.tools.make_arch --config ${copy_to}/arch_config.txt "
     cmd="${cmd} --standalone ${copy_to} ${in_container_arch}"
 
     echo "cd ${copy_to}; ${cmd}" | docker exec -i "${container}" bash
@@ -35,21 +43,25 @@ function redeploy {
     local -r install_path="${1}"
     local -r inventory="${2}"
     local -r arch_path="${3}"
-
-    local -r deploy_cmd="${install_path}/run.sh ssh_deploy"
+    local -r deploy_run_folder="${4}"
 
     # install locally
     rm -rf "${install_path}"
     bash "${arch_path}" "${install_path}"
 
+    pushd "${deploy_run_folder}"
     # redeploy
-    bash "${deploy_cmd}" uninstall "${inventory}"
-    bash "${deploy_cmd}" install "${inventory}"
+    bash "${install_path}/run.sh" ssh_deploy uninstall "${inventory}"
+    bash "${install_path}/run.sh" ssh_deploy install "${inventory}"
 
     # show status
     sleep 1
-    bash "${deploy_cmd}" status --certs-folder "${install_path}/agent_client_keys" "${inventory}"
+    bash "${install_path}/run.sh" ssh_deploy status --certs-folder "${install_path}/agent_client_keys" "${inventory}"
+    popd
 }
 
-build "${CONTAINER_ID}" "${AGENT_PATH}" "${ARCH_PATH}"
-redeploy "${INSTALL_TO}" "${INVENTORY}" "${ARCH_PATH}"
+build "${CONTAINER_ID}" "${AGENT_PATH}" "${MAKE_ARCH_LIB_PATH}" "${ARCH_PATH}"
+
+readonly INSTALL_TO="${2}"
+readonly INVENTORY="${3}"
+redeploy "${INSTALL_TO}" "${INVENTORY}" "${ARCH_PATH}" "${DEPLOY_RUN_FOLDER}"

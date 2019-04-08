@@ -177,7 +177,7 @@ async def deploy(nodes: List[SSH], arch_file: str, max_parallel_uploads: int, ta
             .replace("{KEY_PATH}", target_key_path) \
             .replace("{API_KEY_PATH}", target_api_key_path)
 
-        await node.run(["sudo", "tee", f"/lib/systemd/system/{SERVICE_NAME}"], input_data=service_content)
+        await node.run(["sudo", "tee", f"/lib/systemd/system/{SERVICE_NAME}"], input_data=service_content.encode())
         await node.run(["sudo", "systemctl", "daemon-reload"])
 
     await asyncio.gather(*map(runner, nodes))

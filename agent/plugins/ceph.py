@@ -11,7 +11,8 @@ import logging
 import functools
 import subprocess
 import collections
-from typing import Iterator, List, Dict, Tuple, Any, Callable, Set, Iterable, Coroutine, Optional, AsyncIterator
+from typing import Iterator, List, Dict, Tuple, Any, Callable, Set, Iterable, Coroutine, Optional, AsyncIterator, \
+    Generic, TypeVar
 from collections import defaultdict
 
 from cephlib import (RecId, CephCLI, CephOp, ParseResult, RecordFile, CephHealth, iter_log_messages, iter_ceph_logs_fd,
@@ -118,6 +119,26 @@ class CollectionConfig:
 class LoopCmd(IntEnum):
     reconfig = 1
     exit = 2
+
+
+Msg = TypeVar('Msg')
+
+# just try for fun, can really use
+class TypedQueue(Generic[Msg]):
+    def __init__(self):
+        self.q = asyncio.Queue()
+
+    def put_nowait(self, val: Msg):
+        self.q.put_nowait(val)
+
+    async def get(self) -> Msg:
+        return await self.q.get()
+
+    def task_done(self) -> None:
+        self.q.task_done()
+
+    async def join(self) -> None:
+        await self.q.join()
 
 
 class CephHistoricDumper:

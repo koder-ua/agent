@@ -1,4 +1,4 @@
-sources = agent deploy.sh mirantis_agent.service
+sources = agent mirantis_agent.service_template run.sh
 remove_files = *.c *.pyi *.h *.cpp *.hpp *.dist-info *.pyx *.pxd
 requirements = requirements.txt
 version = 3.7
