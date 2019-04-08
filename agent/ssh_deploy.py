@@ -53,7 +53,7 @@ async def status(nodes: List[SSH], certs_folder: Path):
         ssl_cert_file = certs_folder / f'agent_server.{node.node}.cert'
         client = AsyncRPCClient(node.node,
                                 ssl_cert_file=ssl_cert_file,
-                                access_key=access_key)
+                                api_key=access_key)
 
         try:
             async with client:
@@ -205,7 +205,7 @@ def parse_args(argv: List[str]) -> Any:
     remove_parser = subparsers.add_parser('uninstall', help='Remove service')
 
     for sbp in (deploy_parser, start_parser, stop_parser, status_parser, remove_parser):
-        sbp.add_argument("inventory", metavar='FILE',
+        sbp.add_argument("inventory", metavar='INVENTORY_FILE',
                          help="Path to file with list of ssh ip/names of ceph nodes")
         sbp.add_argument("--ssh-user", metavar='SSH_USER',
                          default=getpass.getuser(),

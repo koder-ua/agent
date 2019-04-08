@@ -272,7 +272,7 @@ class CephHistoricDumper:
 
         for cmd in self.collection_config.extra_cmd:
             try:
-                output[cmd] = await self.cli.run_raw(cmd)
+                output[cmd] = await self.cli.run_no_ceph(cmd)
             except subprocess.SubprocessError as exc:
                 logger.error("Cmd failed: %s", exc)
 

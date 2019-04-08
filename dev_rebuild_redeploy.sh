@@ -62,6 +62,6 @@ function redeploy {
 
 build "${CONTAINER_ID}" "${AGENT_PATH}" "${MAKE_ARCH_LIB_PATH}" "${ARCH_PATH}"
 
-readonly INSTALL_TO="${2}"
-readonly INVENTORY="${3}"
-redeploy "${INSTALL_TO}" "${INVENTORY}" "${ARCH_PATH}" "${DEPLOY_RUN_FOLDER}"
+#readonly INSTALL_TO="${2}"
+#readonly INVENTORY="${3}"
+#redeploy "${INSTALL_TO}" "${INVENTORY}" "${ARCH_PATH}" "${DEPLOY_RUN_FOLDER}"

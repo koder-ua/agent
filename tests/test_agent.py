@@ -284,6 +284,25 @@ async def test_run_timeout(rpc_node: IAgentRPCNode):
 
 
 @pytest.mark.asyncio
+async def test_large_transfer(conn_pool_32: ConnectionPool):
+    with tempfile.NamedTemporaryFile() as dst:
+        dt = ("-" * 150 + "\n").encode() * 100
+        for i in range(100):
+            dst.file.write(dt)
+        dst.file.flush()
+
+    async def read_coro():
+        async with conn_pool_32.connection(test_addr) as rpc_node:
+            for i in range(10):
+                get_dt = await rpc_node.run(f"tail -n 10000 {dst.name}", timeout=15, term_timeout=1)
+                assert get_dt.returncode == 0
+                assert len(get_dt.stdout_b) == 100 * len(dt)
+
+    coros = [read_coro() for i in range(10)]
+    await asyncio.wait(coros)
+
+
+@pytest.mark.asyncio
 async def test_python27(rpc_node: IAgentRPCNode):
     async with rpc_node:
         for proc in [["python2.7", "-c", "import sys; print sys.version_info"],

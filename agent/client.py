@@ -1,4 +1,5 @@
 import os
+import re
 import ssl
 import traceback
 import zlib
@@ -59,7 +60,7 @@ class RPCServerFailure(Exception):
 class AsyncRPCClient:
     def __init__(self, hostname_or_url: str,
                  ssl_cert_file: Optional[Union[str, Path]],
-                 access_key: str,
+                 api_key: str,
                  user: str = USER_NAME,
                  max_retry: int = 3,
                  retry_timeout: int = 5,
@@ -75,7 +76,7 @@ class AsyncRPCClient:
             self._rpc_url = f"https://{hostname_or_url}:{port}/conn"
             self._ping_url = f"https://{hostname_or_url}:{port}/ping"
 
-        self._access_key = access_key
+        self._api_key = api_key
         self._user = user
         self._request_in_progress = False
         self._http_conn = aiohttp.ClientSession()
@@ -88,7 +89,7 @@ class AsyncRPCClient:
         else:
             self._ssl = None
 
-        self._auth = aiohttp.BasicAuth(login=user, password=self._access_key)
+        self._auth = aiohttp.BasicAuth(login=user, password=self._api_key)
         self._post_params = {"url": self._rpc_url, "ssl": self._ssl, "auth": self._auth,
                              "verify_ssl": self._ssl is not None}
 
@@ -272,6 +273,12 @@ class IAgentRPCNode(IAsyncNode):
     async def read(self, path: AnyPath, compress: bool = True) -> bytes:
         return b"".join([chunk async for chunk in self.iter_file(str(path), compress=compress)])
 
+    async def tail_file(self, path: AnyPath, size: int) -> AsyncIterator[bytes]:
+        async with self.conn.streamed.fs.tail(str(path), size) as block_iter:
+            async for tp, chunk in block_iter:
+                assert tp == BlockType.binary
+                yield chunk
+
     async def iter_file(self, path: AnyPath, compress: bool = True) -> AsyncIterator[bytes]:
         async with self.conn.streamed.fs.get_file(str(path), compress=compress) as block_iter:
             if compress:
@@ -394,3 +401,20 @@ class ConnectionPool:
             yield conn
         finally:
             self.release_conn(conn_addr, conn)
+
+
+async def get_sock_count(conn: IAgentRPCNode, pid: int) -> int:
+    return await conn.conn.fs.count_sockets_for_process(pid)
+
+
+async def get_device_for_file(conn: IAgentRPCNode, fname: str) -> Tuple[str, str]:
+    """Find storage device, on which file is located"""
+
+    dev = (await conn.conn.fs.get_dev_for_file(fname)).decode()
+    assert dev.startswith('/dev'), "{!r} is not starts with /dev".format(dev)
+    root_dev = dev = dev.strip()
+    rr = re.match('^(/dev/[shv]d.*?)\\d+', root_dev)
+    if rr:
+        root_dev = rr.group(1)
+    return root_dev, dev
+

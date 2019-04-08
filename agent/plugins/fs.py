@@ -219,3 +219,10 @@ def count_sockets_for_process(pid: int) -> int:
                 raise
 
     return count
+
+
+@expose
+def tail(path: str, bytes: int) -> IReadableAsync:
+    fd = open(path, 'rb')
+    fd.seek(bytes, os.SEEK_END)
+    return ChunkedFile(fd)
