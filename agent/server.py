@@ -105,6 +105,12 @@ def parse_args(argv: List[str]):
     server.add_argument("--key", required=True, help="key file path")
     server.add_argument("--api-key", default=None, help="api key file")
     server.add_argument("--api-key-val", help="Json file api key")
+    server.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], default="INFO",
+                        help="Console log level")
+    server.add_argument("--persistent-log", action='store_true', help="Log to /var/log/mira_agent.log as well")
+    server.add_argument("--persistent-level",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], default="INFO",
+                        help="Persistent log level")
     server.add_argument("--addr", default=f"0.0.0.0:{DEFAULT_PORT}", help="Address to listen on")
 
     subparsers.add_parser('gen_key', help='Generate new key')
@@ -126,7 +132,13 @@ log_config = {
             "level": "DEBUG",
             "class": "logging.StreamHandler",
             "formatter": "simple",
-            "stream"  : "ext://sys.stdout"
+            "stream": "ext://sys.stdout"
+        },
+        "persistent": {
+            "level": "INFO",
+            "class": "logging.FileHandler",
+            "formatter": "simple",
+            "filename": "/var/log/mira_agent.log"
         },
     },
     "loggers": {
@@ -134,10 +146,7 @@ log_config = {
         "storage": {"level": "DEBUG", "handlers": ["console"]},
         "rpc":     {"level": "DEBUG", "handlers": ["console"]},
         "cephlib": {"level": "DEBUG", "handlers": ["console"]},
-        "collect": {"level": "DEBUG", "handlers": ["console"]},
         "agent":   {"level": "DEBUG", "handlers": ["console"]},
-        "report":  {"level": "DEBUG", "handlers": ["console"]},
-        "index":   {"level": "DEBUG", "handlers": ["console"]}
     }
 }
 
@@ -145,11 +154,22 @@ log_config = {
 def main(argv: List[str]) -> int:
     opts = parse_args(argv)
     if opts.subparser_name == 'server':
+
+        if not opts.persistent_log:
+            del log_config['handlers']['persistent']
+        else:
+            log_config['handlers']['persistent']['level'] = opts.persistent_level
+            for lcfg in log_config['loggers'].values():
+                lcfg['handlers'].append('persistent')
+
+        log_config['handlers']['console']['level'] = opts.log_level
         logging.config.dictConfig(log_config)
+
         api_key = opts.api_key_val if opts.api_key is None else open(opts.api_key).read()
         start_rpc_server(opts.addr, opts.cert, opts.key, api_key)
     elif opts.subparser_name == 'gen_key':
-        print("Key={}\nenc_key={}".format(*get_key_enc()))
+        key, enc_key = get_key_enc()
+        print(f"Key={key}\nenc_key={enc_key}")
     else:
         assert False, f"Unknown cmd {opts.subparser_name}"
     return 0

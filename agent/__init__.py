@@ -3,4 +3,4 @@ USER_NAME = 'rpc_client'
 DEFAULT_PORT = 55667
 
 
-from .client import AsyncRPCClient, ConnectionClosed, IAgentRPCNode, ConnectionPool
+from .client import AsyncRPCClient, ConnectionClosed, IAgentRPCNode, ConnectionPool, HistoricCollectionConfig, BlockType

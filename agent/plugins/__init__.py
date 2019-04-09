@@ -1,9 +1,32 @@
 import abc
 import inspect
+import os
 import zlib
 from dataclasses import field, dataclass
 from enum import IntEnum
-from typing import Callable, AsyncIterable, BinaryIO, Any, Optional
+from typing import Callable, AsyncIterable, BinaryIO, Any, Optional, TypeVar, Dict, Type, Generic
+from concurrent.futures._base import CancelledError, TimeoutError as AsyncTimeoutError
+
+
+DEFAULT_ENVIRON = dict(os.environ.items())
+
+
+NO_VAR_MARK = DEFAULT_ENVIRON.get("AGENT_NO_VAR_MARK", "<<empty>>")
+
+
+# return settings for default system python
+if 'ORIGIN_PYTHONHOME' in DEFAULT_ENVIRON:
+    if DEFAULT_ENVIRON['ORIGIN_PYTHONHOME'].strip() == NO_VAR_MARK:
+        del DEFAULT_ENVIRON['PYTHONHOME']
+    else:
+        DEFAULT_ENVIRON['PYTHONHOME'] = DEFAULT_ENVIRON['ORIGIN_PYTHONHOME']
+
+
+if 'ORIGIN_PYTHONPATH' in DEFAULT_ENVIRON:
+    if DEFAULT_ENVIRON['ORIGIN_PYTHONPATH'].strip() == NO_VAR_MARK:
+        del DEFAULT_ENVIRON['PYTHONPATH']
+    else:
+        DEFAULT_ENVIRON['PYTHONPATH'] = DEFAULT_ENVIRON['ORIGIN_PYTHONPATH']
 
 
 def validate_name(name: str):
@@ -25,6 +48,51 @@ def expose_func(module: str, func: Callable):
         validate_name(func.__name__)
         exposed[module + "::" + func.__name__] = func
     return func
+
+
+T = TypeVar('T')
+
+
+@dataclass
+class RPCClass(Generic[T]):
+    pack: Callable[[T], Dict[str, Any]]
+    unpack: Callable[[Dict[str, Any]], T]
+
+
+exposed_classes: Dict[str, RPCClass] = {}
+
+
+def default_pack(val: Any) -> Dict[str, Any]:
+    return val.__dict__
+
+
+class Tmp: pass
+
+
+def default_unpack(tp: T) -> Callable[[Dict[str, Any]], T]:
+    def unpack_closure(attrs: Dict[str, Any]) -> T:
+        t = Tmp()
+        t.__class__ = tp
+        t.__dict__.update(attrs)
+        return t
+    return unpack_closure
+
+
+def expose_type(tp: Type[T],
+                pack: Callable[[T], Dict[str, Any]] = None,
+                unpack: Callable[[Dict[str, Any]], T] = None) -> Type[T]:
+    if pack is None:
+        if hasattr(tp, "__to_json__"):
+            pack = tp.__json_reduce__
+        else:
+            pack = default_pack
+    if unpack is None:
+        if hasattr(tp, "__from_json__"):
+            unpack = tp.__from_json__
+        else:
+            unpack = default_unpack(tp)
+    exposed_classes[f"{tp.__module__}::{tp.__name__}"] = RPCClass(pack, unpack)
+    return tp
 
 
 DEFAULT_FILE_CHUNK = 1 << 20
@@ -129,3 +197,4 @@ class ZlibStreamDecompressor(IReadableAsync):
 
 
 from . import ceph, cli, fs, system
+from .ceph import HistoricCollectionConfig

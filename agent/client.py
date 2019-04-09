@@ -17,7 +17,8 @@ import aiohttp
 from koder_utils import CMDResult, CmdType, IAsyncNode, AnyPath
 
 from . import USER_NAME, DEFAULT_PORT
-from .plugins import IReadableAsync, ChunkedFile, ZlibStreamDecompressor, DEFAULT_HTTP_CHUNK, ZlibStreamCompressor
+from .plugins import (IReadableAsync, ChunkedFile, ZlibStreamDecompressor, DEFAULT_HTTP_CHUNK, ZlibStreamCompressor,
+                      HistoricCollectionConfig)
 from .rpc import BlockType, deserialize, CALL_FAILED, CALL_SUCCEEDED, serialize
 
 
@@ -356,8 +357,10 @@ class ConnectionPool:
         self.max_conn_per_node = max_conn_per_node
         self.certificates = certificates
         self.extra_kwargs = extra_kwargs
+        self.opened = False
 
     async def get_conn(self, conn_addr: str) -> IAgentRPCNode:
+        assert self.opened, "Pool is not opened"
         while True:
             free_cons = self.free_conn.setdefault(conn_addr, [])
             if free_cons:
@@ -371,6 +374,7 @@ class ConnectionPool:
             await asyncio.sleep(0.5)
 
     def release_conn(self, conn_addr: str, conn: IAgentRPCNode) -> None:
+        assert self.opened, "Pool is not opened"
         return self.free_conn[conn_addr].append(conn)
 
     async def _rpc_connect(self, conn_addr: str) -> IAgentRPCNode:
@@ -384,15 +388,19 @@ class ConnectionPool:
         return IAgentRPCNode(conn_addr, rpc)
 
     async def __aenter__(self) -> 'ConnectionPool':
+        assert not self.opened, "Pool already opened"
+        self.opened = True
         return self
 
     async def __aexit__(self, x, y, z) -> None:
+        assert self.opened, "Pool is not opened"
         for addr, conns in self.free_conn.items():
             assert len(conns) == self.conn_per_node[addr]
             for conn in conns:
                 await conn.__aexit__(x, y, z)
             self.conn_per_node[addr] = 0
         self.free_conn = {}
+        self.opened = False
 
     @asynccontextmanager
     async def connection(self, conn_addr: str) -> AsyncIterator[IAgentRPCNode]:

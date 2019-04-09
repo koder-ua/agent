@@ -5,7 +5,7 @@ import struct
 
 from typing import Any, Dict, List, Tuple, Optional, NamedTuple, AsyncIterator, AsyncIterable
 
-from .plugins import IReadableAsync, BlockType
+from .plugins import IReadableAsync, BlockType, exposed_classes
 
 
 EOD_MARKER = b'\x00'
@@ -39,7 +39,7 @@ def do_prepare_for_json(val: Any, streams: List[IReadableAsync]) -> Any:
     if vt is bytes:
         return {CUSTOM_TYPE_KEY: BYTES_TYPE, 'val': base64.b64encode(val).decode('ascii')}
 
-    if vt is list or vt is tuple:
+    if vt in (list, tuple):
         return [do_prepare_for_json(i, streams) for i in val]
 
     if vt is dict:
@@ -51,6 +51,10 @@ def do_prepare_for_json(val: Any, streams: List[IReadableAsync]) -> Any:
         assert len(streams) == 0, "Params can only contains single stream"
         streams.append(val)
         return {CUSTOM_TYPE_KEY: STREAM_TYPE}
+
+    key = f"{val.__class__.__module__}::{val.__class__.__name__}"
+    if key in exposed_classes:
+        return {CUSTOM_TYPE_KEY: key, "attrs": exposed_classes[key].pack(val)}
 
     raise TypeError(f"Can't serialize value of type {vt}")
 
@@ -81,15 +85,17 @@ def do_unpack_from_json(val: Any, streams: List) -> Any:
         return [do_unpack_from_json(i, streams) for i in val]
 
     if vt is dict:
-        cctype = val.get(CUSTOM_TYPE_KEY)
-        if cctype is None:
+        class_fqname = val.get(CUSTOM_TYPE_KEY)
+        if class_fqname is None:
             assert all(isinstance(key, str) for key in val)
             return {key: do_unpack_from_json(value, streams) for key, value in val.items()}
-        elif cctype == STREAM_TYPE:
+        elif class_fqname == STREAM_TYPE:
             assert streams
             return streams.pop()
-        elif cctype == BYTES_TYPE:
+        elif class_fqname == BYTES_TYPE:
             return base64.b64decode(val['val'].encode('ascii'))
+        elif class_fqname in exposed_classes:
+            return exposed_classes[class_fqname].unpack(val['attrs'])
 
     raise TypeError(f"Can't deserialize value of type {vt}")
 

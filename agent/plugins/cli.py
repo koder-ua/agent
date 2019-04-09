@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple, Dict
 
 from koder_utils import start_proc, run_proc_timeout, CmdType, CMDResult
 
-from . import expose_func
+from . import expose_func, DEFAULT_ENVIRON
 
 expose = functools.partial(expose_func, "cli")
 
@@ -21,27 +21,6 @@ logger = logging.getLogger("agent.cli")
 all_procs: List[asyncio.subprocess.Process] = []
 last_killall_requested: int = 0
 last_killall_sig: Optional[int] = None
-
-
-DEFAULT_ENVIRON = dict(os.environ.items())
-
-
-NO_VAR_MARK = DEFAULT_ENVIRON.get("AGENT_NO_VAR_MARK", "<<empty>>")
-
-
-# return settings for default system python
-if 'ORIGIN_PYTHONHOME' in DEFAULT_ENVIRON:
-    if DEFAULT_ENVIRON['ORIGIN_PYTHONHOME'].strip() == NO_VAR_MARK:
-        del DEFAULT_ENVIRON['PYTHONHOME']
-    else:
-        DEFAULT_ENVIRON['PYTHONHOME'] = DEFAULT_ENVIRON['ORIGIN_PYTHONHOME']
-
-
-if 'ORIGIN_PYTHONPATH' in DEFAULT_ENVIRON:
-    if DEFAULT_ENVIRON['ORIGIN_PYTHONPATH'].strip() == NO_VAR_MARK:
-        del DEFAULT_ENVIRON['PYTHONPATH']
-    else:
-        DEFAULT_ENVIRON['PYTHONPATH'] = DEFAULT_ENVIRON['ORIGIN_PYTHONPATH']
 
 
 # TODO: make this streaming data from process to caller
