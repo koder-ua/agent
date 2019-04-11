@@ -4,7 +4,6 @@ import os
 import subprocess
 import tempfile
 from io import BytesIO
-import distutils.spawn
 from typing import Iterator, Tuple, Dict, Any, List
 
 import pytest

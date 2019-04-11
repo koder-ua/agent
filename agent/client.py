@@ -356,7 +356,7 @@ class ConnectionPool(BaseConnectionPool[IAgentRPCNode]):
 
     async def _rpc_connect(self, conn_addr: str) -> IAgentRPCNode:
         """Connect to nodes and fill Node object with basic node info: ips and hostname"""
-        rpc = AsyncRPCClient(conn_addr, ssl_cert_file=self.certificates[conn_addr], **self.extra_kwargs)
+        rpc = AsyncRPCClient(hostname_or_url=conn_addr, ssl_cert_file=self.certificates[conn_addr], **self.extra_kwargs)
         await rpc.__aenter__()
         return IAgentRPCNode(conn_addr, rpc)
 
@@ -396,5 +396,6 @@ async def get_device_for_file(conn: IAgentRPCNode, fname: str) -> Tuple[str, str
 
 
 def get_connection_pool_cfg(cfg: AgentConfig) -> ConnectionPool:
-    certificates = get_certificates(cfg.secrets, cfg.ssl_cert_templ)
-    return ConnectionPool(certificates, max_conn_per_node=int(cfg.max_conn), api_key=cfg.api_key.open().read())
+    certificates = get_certificates(cfg.ssl_cert_templ)
+    return ConnectionPool(certificates, port=cfg.server_port,
+                          max_conn_per_node=cfg.max_conn, api_key=cfg.api_key.open().read())

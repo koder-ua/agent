@@ -31,9 +31,7 @@ function build {
     docker cp "${agent_path}" "${container}:${copy_to}"
     docker cp "${libpath}" "${container}:${copy_to}"
 
-    local cmd="python3.7 -m koder_utils.tools.make_arch --config ${copy_to}/arch_config.txt "
-    cmd="${cmd} --standalone ${copy_to} ${in_container_arch}"
-
+    local -r cmd="python3.7 -m koder_utils.tools.make_arch --standalone ${copy_to} ${in_container_arch}"
     echo "cd ${copy_to}; ${cmd}" | docker exec -i "${container}" bash
     docker cp "${container}:${in_container_arch}" "${arch_path}"
 }
@@ -46,18 +44,18 @@ function redeploy {
     local -r deploy_run_folder="${4}"
 
     # install locally
-    rm -rf "${install_path}"
-    bash "${arch_path}" "${install_path}"
+    rm -rf "${install_path}/*"
+    bash "${arch_path}" --install "${install_path}"
 
-    pushd "${deploy_run_folder}"
-    # redeploy
-    bash "${install_path}/run.sh" ssh_deploy uninstall "${inventory}"
-    bash "${install_path}/run.sh" ssh_deploy install "${inventory}"
-
-    # show status
-    sleep 1
-    bash "${install_path}/run.sh" ssh_deploy status --certs-folder "${install_path}/agent_client_keys" "${inventory}"
-    popd
+#    pushd "${deploy_run_folder}"
+#    # redeploy
+#    bash "${install_path}/ctl" uninstall --inventory "${inventory}"
+#    bash "${install_path}/ctl" install --inventory "${inventory}"
+#
+#    # show status
+#    sleep 1
+#    bash "${install_path}/ctl" status --inventory "${inventory}"
+#    popd
 }
 
 build "${CONTAINER_ID}" "${AGENT_PATH}" "${MAKE_ARCH_LIB_PATH}" "${ARCH_PATH}"
