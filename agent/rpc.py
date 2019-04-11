@@ -5,7 +5,7 @@ import struct
 
 from typing import Any, Dict, List, Tuple, Optional, NamedTuple, AsyncIterator, AsyncIterable
 
-from .plugins import IReadableAsync, BlockType, exposed_classes
+from .plugins import IReadableAsync, BlockType, exposed_types
 
 
 EOD_MARKER = b'\x00'
@@ -53,8 +53,8 @@ def do_prepare_for_json(val: Any, streams: List[IReadableAsync]) -> Any:
         return {CUSTOM_TYPE_KEY: STREAM_TYPE}
 
     key = f"{val.__class__.__module__}::{val.__class__.__name__}"
-    if key in exposed_classes:
-        return {CUSTOM_TYPE_KEY: key, "attrs": exposed_classes[key].pack(val)}
+    if key in exposed_types:
+        return {CUSTOM_TYPE_KEY: key, "attrs": exposed_types[key].pack(val)}
 
     raise TypeError(f"Can't serialize value of type {vt}")
 
@@ -94,8 +94,8 @@ def do_unpack_from_json(val: Any, streams: List) -> Any:
             return streams.pop()
         elif class_fqname == BYTES_TYPE:
             return base64.b64decode(val['val'].encode('ascii'))
-        elif class_fqname in exposed_classes:
-            return exposed_classes[class_fqname].unpack(val['attrs'])
+        elif class_fqname in exposed_types:
+            return exposed_types[class_fqname].unpack(val['attrs'])
 
     raise TypeError(f"Can't deserialize value of type {vt}")
 

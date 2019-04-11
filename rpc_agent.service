@@ -5,8 +5,7 @@ Description=Mirantis rpc agent
 WorkingDirectory={INSTALL}
 Environment=PYTHONUNBUFFERED=1
 Type=simple
-ExecStart=/usr/bin/env bash "{INSTALL}/run.sh" server server --cert "{CERT_PATH}" --key "{KEY_PATH}" \
-     --api-key "{API_KEY_PATH}"
+ExecStart=/usr/bin/env bash "{INSTALL}/run.sh" server server --config '{CONFIG_PATH}'
 StandardOutput=null
 
 [Install]

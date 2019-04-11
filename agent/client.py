@@ -4,7 +4,6 @@ import ssl
 import traceback
 import zlib
 import http
-from contextlib import asynccontextmanager
 from io import BytesIO
 import time
 import logging
@@ -14,11 +13,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, AsyncIterator, BinaryIO, NamedTuple, cast, Iterable
 
 import aiohttp
-from koder_utils import CMDResult, CmdType, IAsyncNode, AnyPath
+from koder_utils import CMDResult, CmdType, IAsyncNode, AnyPath, BaseConnectionPool
 
-from . import USER_NAME, DEFAULT_PORT
-from .plugins import (IReadableAsync, ChunkedFile, ZlibStreamDecompressor, DEFAULT_HTTP_CHUNK, ZlibStreamCompressor,
-                      HistoricCollectionConfig)
+from .common import USER_NAME, get_certificates, AgentConfig
+from .plugins import (IReadableAsync, ChunkedFile, ZlibStreamDecompressor, DEFAULT_HTTP_CHUNK, ZlibStreamCompressor)
 from .rpc import BlockType, deserialize, CALL_FAILED, CALL_SUCCEEDED, serialize
 
 
@@ -59,13 +57,14 @@ class RPCServerFailure(Exception):
 
 
 class AsyncRPCClient:
-    def __init__(self, hostname_or_url: str,
+    def __init__(self,
+                 hostname_or_url: str,
+                 port: int,
                  ssl_cert_file: Optional[Union[str, Path]],
                  api_key: str,
                  user: str = USER_NAME,
                  max_retry: int = 3,
-                 retry_timeout: int = 5,
-                 port: int = DEFAULT_PORT) -> None:
+                 retry_timeout: int = 5) -> None:
 
         if hostname_or_url.startswith("http://") or hostname_or_url.startswith("https://"):
             self._rpc_url = hostname_or_url
@@ -349,66 +348,35 @@ class IAgentRPCNode(IAsyncNode):
         raise ValueError(f"Unsupported mode {mode}")
 
 
-class ConnectionPool:
+class ConnectionPool(BaseConnectionPool[IAgentRPCNode]):
     def __init__(self, certificates: Dict[str, Any], max_conn_per_node: int, **extra_kwargs) -> None:
-
-        self.free_conn: Dict[str, List[IAgentRPCNode]] = {}
-        self.conn_per_node: Dict[str, int] = {}
-        self.max_conn_per_node = max_conn_per_node
+        BaseConnectionPool.__init__(self, max_conn_per_node=max_conn_per_node)
         self.certificates = certificates
         self.extra_kwargs = extra_kwargs
-        self.opened = False
-
-    async def get_conn(self, conn_addr: str) -> IAgentRPCNode:
-        assert self.opened, "Pool is not opened"
-        while True:
-            free_cons = self.free_conn.setdefault(conn_addr, [])
-            if free_cons:
-                return free_cons.pop()
-
-            if self.conn_per_node.setdefault(conn_addr, 0) < self.max_conn_per_node:
-                self.conn_per_node[conn_addr] += 1
-                new_conn = await self._rpc_connect(conn_addr)
-                return new_conn
-
-            await asyncio.sleep(0.5)
-
-    def release_conn(self, conn_addr: str, conn: IAgentRPCNode) -> None:
-        assert self.opened, "Pool is not opened"
-        return self.free_conn[conn_addr].append(conn)
 
     async def _rpc_connect(self, conn_addr: str) -> IAgentRPCNode:
         """Connect to nodes and fill Node object with basic node info: ips and hostname"""
-
-        rpc = AsyncRPCClient(conn_addr,
-                             ssl_cert_file=self.certificates[conn_addr],
-                             **self.extra_kwargs)
-
+        rpc = AsyncRPCClient(conn_addr, ssl_cert_file=self.certificates[conn_addr], **self.extra_kwargs)
         await rpc.__aenter__()
         return IAgentRPCNode(conn_addr, rpc)
 
-    async def __aenter__(self) -> 'ConnectionPool':
-        assert not self.opened, "Pool already opened"
-        self.opened = True
-        return self
+    async def _rpc_disconnect(self, conn: IAgentRPCNode) -> None:
+        await conn.__aexit__(None, None, None)
 
-    async def __aexit__(self, x, y, z) -> None:
-        assert self.opened, "Pool is not opened"
-        for addr, conns in self.free_conn.items():
-            assert len(conns) == self.conn_per_node[addr]
-            for conn in conns:
-                await conn.__aexit__(x, y, z)
-            self.conn_per_node[addr] = 0
-        self.free_conn = {}
-        self.opened = False
 
-    @asynccontextmanager
-    async def connection(self, conn_addr: str) -> AsyncIterator[IAgentRPCNode]:
-        conn = await self.get_conn(conn_addr)
+async def check_nodes(inventory: List[str], pool: ConnectionPool) -> Tuple[List[str], List[str]]:
+    failed = []
+    good_hosts = []
+    for hostname in inventory:
         try:
-            yield conn
-        finally:
-            self.release_conn(conn_addr, conn)
+            async with pool.connection(hostname) as conn:
+                if "test" == await conn.conn.sys.ping("test"):
+                    good_hosts.append(hostname)
+                else:
+                    failed.append(hostname)
+        except:
+            failed.append(hostname)
+    return good_hosts, failed
 
 
 async def get_sock_count(conn: IAgentRPCNode, pid: int) -> int:
@@ -426,3 +394,7 @@ async def get_device_for_file(conn: IAgentRPCNode, fname: str) -> Tuple[str, str
         root_dev = rr.group(1)
     return root_dev, dev
 
+
+def get_connection_pool_cfg(cfg: AgentConfig) -> ConnectionPool:
+    certificates = get_certificates(cfg.secrets, cfg.ssl_cert_templ)
+    return ConnectionPool(certificates, max_conn_per_node=int(cfg.max_conn), api_key=cfg.api_key.open().read())

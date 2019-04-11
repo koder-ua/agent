@@ -3,14 +3,38 @@ import inspect
 import os
 import zlib
 from dataclasses import field, dataclass
-from enum import IntEnum
-from typing import Callable, AsyncIterable, BinaryIO, Any, Optional, TypeVar, Dict, Type, Generic
-from concurrent.futures._base import CancelledError, TimeoutError as AsyncTimeoutError
+from enum import Enum
+from typing import Callable, AsyncIterable, BinaryIO, Any, Optional, TypeVar, Dict, Type, Generic, List
+
+from ..common import AgentConfig
+
+
+DEFAULT_FILE_CHUNK = 1 << 20
+DEFAULT_HTTP_CHUNK = 1 << 16
+DEFAULT_COMPRESSOR_CHUNK = DEFAULT_HTTP_CHUNK
+
+
+class BlockType(Enum):
+    json = 1
+    binary = 2
+
+
+# shared config for plugins
+# should be filled from config file and cli before any client request get served
+# and never changed. Have to use list to be able to update it during runtime
+CONFIG_OBJ: List[Optional[AgentConfig]] = [None]
+
+
+def get_current_config() -> AgentConfig:
+    assert CONFIG_OBJ[0]
+    return CONFIG_OBJ[0]
+
+
+# as we updating PYTHONHOME to start this binary we need to reset it value to original, in other case
+# all python-dependent commands will fail
 
 
 DEFAULT_ENVIRON = dict(os.environ.items())
-
-
 NO_VAR_MARK = DEFAULT_ENVIRON.get("AGENT_NO_VAR_MARK", "<<empty>>")
 
 
@@ -59,23 +83,19 @@ class RPCClass(Generic[T]):
     unpack: Callable[[Dict[str, Any]], T]
 
 
-exposed_classes: Dict[str, RPCClass] = {}
-
-
 def default_pack(val: Any) -> Dict[str, Any]:
     return val.__dict__
 
 
-class Tmp: pass
-
-
 def default_unpack(tp: T) -> Callable[[Dict[str, Any]], T]:
     def unpack_closure(attrs: Dict[str, Any]) -> T:
-        t = Tmp()
-        t.__class__ = tp
-        t.__dict__.update(attrs)
-        return t
+        obj = tp.__new__(tp)
+        obj.__dict__.update(attrs)
+        return obj
     return unpack_closure
+
+
+exposed_types: Dict[str, RPCClass] = {}
 
 
 def expose_type(tp: Type[T],
@@ -91,18 +111,8 @@ def expose_type(tp: Type[T],
             unpack = tp.__from_json__
         else:
             unpack = default_unpack(tp)
-    exposed_classes[f"{tp.__module__}::{tp.__name__}"] = RPCClass(pack, unpack)
+    exposed_types[f"{tp.__module__}::{tp.__name__}"] = RPCClass(pack, unpack)
     return tp
-
-
-DEFAULT_FILE_CHUNK = 1 << 20
-DEFAULT_HTTP_CHUNK = 1 << 16
-DEFAULT_COMPRESSOR_CHUNK = DEFAULT_HTTP_CHUNK
-
-
-class BlockType(IntEnum):
-    json = 1
-    binary = 2
 
 
 class IReadableAsync(AsyncIterable[bytes]):
@@ -197,4 +207,4 @@ class ZlibStreamDecompressor(IReadableAsync):
 
 
 from . import ceph, cli, fs, system
-from .ceph import HistoricCollectionConfig
+from .ceph import HistoricCollectionConfig, HistoricCollectionStatus
