@@ -395,7 +395,7 @@ async def get_device_for_file(conn: IAgentRPCNode, fname: str) -> Tuple[str, str
     return root_dev, dev
 
 
-def get_connection_pool_cfg(cfg: AgentConfig) -> ConnectionPool:
+def get_connection_pool(cfg: AgentConfig) -> ConnectionPool:
     certificates = get_certificates(cfg.ssl_cert_templ)
     return ConnectionPool(certificates, port=cfg.server_port,
                           max_conn_per_node=cfg.max_conn, api_key=cfg.api_key.open().read())

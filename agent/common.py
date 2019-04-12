@@ -11,7 +11,9 @@ from koder_utils import RAttredDict
 
 MAX_FILE_SIZE = 1 << 30
 USER_NAME = 'rpc_client'
-AGENT_INSTALL_PATH = Path(__file__).parent.parent
+AGENT_INSTALL_PATH = Path(__file__).parent.parent.resolve()
+logger = logging.getLogger('agent')
+
 
 @dataclass
 class AgentConfig:
@@ -47,18 +49,26 @@ def get_config_default_path() -> Path:
 
 def get_config(path: Path = None) -> AgentConfig:
     cfg = configparser.ConfigParser()
-    if path:
-        cfg.read_file(path.open())
-    else:
-        cfg.read(get_config_default_path())
+
+    if not path:
+        path = get_config_default_path()
+
+    if not path.exists():
+        raise RuntimeError(f"Can't find config file at {path}")
+
+    cfg.read_file(path.open())
 
     rcfg = RAttredDict(cfg)
 
     common = rcfg.common
     server = rcfg.server
 
-    path_formatters: Dict[str, str] = {}
-    for name, val in [('root', common.root), ('secrets', common.secrets), ('storage', server.storage)]:
+    if common.root == 'AUTO':
+        path_formatters: Dict[str, str] = {'root': AGENT_INSTALL_PATH}
+    else:
+        path_formatters: Dict[str, str] = {'root': common.root}
+
+    for name, val in [('secrets', common.secrets), ('storage', server.storage)]:
         path_formatters[name] = val.format(**path_formatters)
 
     def mkpath(val: str) -> Path:
@@ -78,7 +88,7 @@ def get_config(path: Path = None) -> AgentConfig:
         log_config=mkpath(common.log_config),
         server_port=int(common.server_port),
         log_level=common.log_level,
-        config=mkpath(common.config),
+        config=path,
         cmd_timeout=int(common.cmd_timeout),
 
         storage=mkpath(server.storage),
@@ -140,6 +150,8 @@ def config_logging(cfg: AgentConfig, no_persistent: bool = False):
         del log_config['handlers']['persistent']
     else:
         log_config['handlers']['persistent']['level'] = cfg.persistent_log_level
+        if not cfg.persistent_log.parent.exists():
+            cfg.persistent_log.parent.mkdir(parents=True)
         log_config['handlers']['persistent']['filename'] = str(cfg.persistent_log)
         for lcfg in log_config['loggers'].values():
             lcfg['handlers'].append('persistent')

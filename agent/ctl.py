@@ -12,11 +12,11 @@ from typing import List, Any
 
 from koder_utils import SSH, read_inventory, make_secure, make_cert_and_key, rpc_map, b2ssize
 
-from . import AsyncRPCClient, get_connection_pool_cfg
+from . import AsyncRPCClient, get_connection_pool
 from .common import get_key_enc, get_config, get_config_default_path, AgentConfig, config_logging
 
 
-logger = logging.getLogger("ctl")
+logger = logging.getLogger("agent.ctl")
 LOCAL_INSTALL_PATH = Path(__file__).resolve().parent.parent
 SERVICE_FILE_DIR = Path("/lib/systemd/system")
 
@@ -44,28 +44,30 @@ async def start(service: str, nodes: List[SSH]) -> None:
     await asyncio.gather(*[node.run(["sudo", "systemctl", "start", service]) for node in nodes])
 
 
-async def remove(cfg: Any, nodes: List[SSH]):
+async def remove(cfg: AgentConfig, nodes: List[SSH]):
     logger.info(f"Removing rpc_agent from nodes {' '.join(node.node for node in nodes)}")
 
     try:
-        await disable(cfg.server.service, nodes)
+        await disable(cfg.service_name, nodes)
     except subprocess.SubprocessError:
         pass
 
     try:
-        await stop(cfg.server.service, nodes)
+        await stop(cfg.service_name, nodes)
     except subprocess.SubprocessError:
         pass
 
     async def runner(node: SSH) -> None:
         agent_folder = Path(cfg.root)
-        service_target = SERVICE_FILE_DIR / cfg.server.service
+        service_target = SERVICE_FILE_DIR / cfg.service_name
 
         await node.run(["sudo", "rm", "--force", str(service_target)])
         await node.run(["sudo", "systemctl", "daemon-reload"])
 
-        for folder in (agent_folder, cfg.server.storage):
-            assert re.match(r"/[a-zA-Z0-9-_]+/rpc_agent$", str(folder)), \
+        logger.info("Removing files")
+
+        for folder in (agent_folder, cfg.storage):
+            assert re.match(r"/[a-zA-Z0-9_/-]+/rpc_agent$", str(folder)), \
                 f"{folder} not match re of allowed to rm path"
             await node.run(["sudo", "rm", "--preserve-root", "--recursive", "--force", str(folder)])
 
@@ -105,7 +107,7 @@ async def deploy(cfg: AgentConfig, nodes: List[SSH], max_parallel_uploads: int, 
 
         temp_arch_file = f"/tmp/rpc_agent_{uuid.uuid1()!s}.tar.gz"
 
-        logger.debug(f"Copying {b2ssize(cfg.arch_file.stat().st_size)} bytes of archive to {node.node}")
+        logger.debug(f"Copying {b2ssize(cfg.arch_file.stat().st_size)}B of archive to {node.node}")
         async with upload_semaphore:
             await node.copy(cfg.arch_file, temp_arch_file)
 
@@ -152,15 +154,18 @@ async def deploy(cfg: AgentConfig, nodes: List[SSH], max_parallel_uploads: int, 
 # --------------- RPC BASED CONTROLS FUNCTIONS -------------------------------------------------------------------------
 
 
-async def check_node(conn: AsyncRPCClient) -> bool:
-    return await conn.conn.sys.ping(_call_timeout=5)
+async def check_node(conn: AsyncRPCClient, hostname: str) -> bool:
+    return await conn.conn.sys.ping("test", _call_timeout=5) == 'test'
 
 
 async def status(cfg: Any, nodes: List[str]) -> None:
-    async with get_connection_pool_cfg(cfg) as pool:
+    async with get_connection_pool(cfg) as pool:
         max_node_name_len = max(map(len, nodes))
         async for node_name, res in rpc_map(pool, check_node, nodes):
-            logger.info("{0:>{1}} {2:>8}".format(node_name, max_node_name_len, "RUN" if res else "NOT RUN"))
+            if isinstance(res, Exception):
+                logger.error(f"{node_name} - error: {res!s}")
+            else:
+                logger.info("{0:>{1}} {2:>8}".format(node_name, max_node_name_len, "RUN" if res else "NOT RUN"))
 
 
 def parse_args(argv: List[str]) -> Any:
@@ -212,10 +217,10 @@ def main(argv: List[str]) -> int:
         asyncio.run(deploy(cfg, nodes, max_parallel_uploads=opts.max_parallel_uploads, inventory=inventory))
     elif opts.subparser_name == 'start':
         asyncio.run(start(cfg.service_name, nodes))
-    elif opts.subparser_name == 'uninstall':
-        asyncio.run(remove(cfg.service_name, nodes))
-    elif opts.subparser_name == 'uninstall':
+    elif opts.subparser_name == 'stop':
         asyncio.run(stop(cfg.service_name, nodes))
+    elif opts.subparser_name == 'uninstall':
+        asyncio.run(remove(cfg, nodes))
     else:
         assert False, f"Unknown command {opts.subparser_name}"
     return 0

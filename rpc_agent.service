@@ -3,9 +3,9 @@ Description=Mirantis rpc agent
 
 [Service]
 WorkingDirectory={INSTALL}
-Environment=PYTHONUNBUFFERED=1
+Environment="PYTHONUNBUFFERED=1" "PYTHONPATH={INSTALL}"
 Type=simple
-ExecStart=/usr/bin/env bash "{INSTALL}/run.sh" server server --config '{CONFIG_PATH}'
+ExecStart="{INSTALL}/python/python3.7" -m agent.server server --config '{CONFIG_PATH}'
 StandardOutput=null
 
 [Install]

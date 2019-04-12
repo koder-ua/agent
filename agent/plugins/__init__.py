@@ -4,7 +4,7 @@ import os
 import zlib
 from dataclasses import field, dataclass
 from enum import Enum
-from typing import Callable, AsyncIterable, BinaryIO, Any, Optional, TypeVar, Dict, Type, Generic, List
+from typing import Callable, AsyncIterable, BinaryIO, Any, Optional, TypeVar, Dict, Type, Generic, List, Coroutine
 
 from ..common import AgentConfig
 
@@ -71,6 +71,22 @@ def expose_func(module: str, func: Callable):
         validate_name(module)
         validate_name(func.__name__)
         exposed[module + "::" + func.__name__] = func
+    return func
+
+
+on_server_startup = []
+
+
+def register_startup(func: Callable[[], Coroutine[Any, Any, None]]) -> Callable[[], Coroutine[Any, Any, None]]:
+    on_server_startup.append(func)
+    return func
+
+
+on_server_shutdown = []
+
+
+def register_shutdown(func: Callable[[], Coroutine[Any, Any, None]]) -> Callable[[], Coroutine[Any, Any, None]]:
+    on_server_startup.append(func)
     return func
 
 

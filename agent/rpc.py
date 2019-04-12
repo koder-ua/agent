@@ -52,9 +52,9 @@ def do_prepare_for_json(val: Any, streams: List[IReadableAsync]) -> Any:
         streams.append(val)
         return {CUSTOM_TYPE_KEY: STREAM_TYPE}
 
-    key = f"{val.__class__.__module__}::{val.__class__.__name__}"
+    key = f"{vt.__module__}::{vt.__name__}"
     if key in exposed_types:
-        return {CUSTOM_TYPE_KEY: key, "attrs": exposed_types[key].pack(val)}
+        return {CUSTOM_TYPE_KEY: key, "attrs": do_prepare_for_json(exposed_types[key].pack(val), streams)}
 
     raise TypeError(f"Can't serialize value of type {vt}")
 

@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 
-from agent import AsyncRPCClient, IAgentRPCNode
+from agent import AsyncRPCClient, IAgentRPCNode, get_config
 
 
 # ------------------    HELPERS    -------------------------------------------
@@ -9,14 +9,15 @@ from agent import AsyncRPCClient, IAgentRPCNode
 
 test_addr = "localhost"
 path = Path(__file__).parent
-test_cert_path = path / "test_cert.crt"
-test_key_path = path / "test_key.key"
-api_key = (path / "api_key.raw").open().read()
 
 
 @pytest.fixture
 async def rpc_node():
-    conn = AsyncRPCClient(test_addr, test_cert_path, api_key)
+    cfg = get_config(path / 'config.cfg')
+    conn = AsyncRPCClient(test_addr,
+                          ssl_cert_file=cfg.ssl_cert,
+                          api_key=cfg.api_key.open().read(),
+                          port=cfg.server_port)
     return IAgentRPCNode(test_addr, conn)
 
 

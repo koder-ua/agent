@@ -25,7 +25,6 @@
         "cmd":     {"level": "DEBUG", "handlers": ["console"]},
         "storage": {"level": "DEBUG", "handlers": ["console"]},
         "rpc":     {"level": "DEBUG", "handlers": ["console"]},
-        "ctl":     {"level": "DEBUG", "handlers": ["console"]},
         "cephlib": {"level": "DEBUG", "handlers": ["console"]},
         "agent":   {"level": "DEBUG", "handlers": ["console"]}
     }

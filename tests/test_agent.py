@@ -9,7 +9,7 @@ from typing import Iterator, Tuple, Dict, Any, List
 import pytest
 from pathlib import Path
 
-from agent import AsyncRPCClient, IAgentRPCNode, ConnectionPool
+from agent import AsyncRPCClient, IAgentRPCNode, ConnectionPool, get_config
 
 
 # ------------------    HELPERS    -------------------------------------------
@@ -17,25 +17,33 @@ from agent import AsyncRPCClient, IAgentRPCNode, ConnectionPool
 
 test_addr = "localhost"
 path = Path(__file__).parent
-test_cert_path = path / "test_cert.crt"
-test_key_path = path / "test_key.key"
-api_key = (path / "api_key.raw").open().read()
-
 
 @pytest.fixture
 async def rpc_node():
-    conn = AsyncRPCClient(test_addr, test_cert_path, api_key)
+    cfg = get_config(path / 'config.cfg')
+    conn = AsyncRPCClient(test_addr,
+                          ssl_cert_file=cfg.ssl_cert,
+                          api_key=cfg.api_key.open().read(),
+                          port=cfg.server_port)
     return IAgentRPCNode(test_addr, conn)
 
 
 @pytest.fixture
 async def conn_pool_32():
-    return ConnectionPool(access_key=api_key, certificates={test_addr: test_cert_path}, max_conn_per_node=32)
+    cfg = get_config(path / 'config.cfg')
+    return ConnectionPool(api_key=cfg.api_key.open().read(),
+                          certificates={test_addr: cfg.ssl_cert},
+                          max_conn_per_node=32,
+                          port=cfg.server_port)
 
 
 @pytest.fixture
 async def conn_pool_2():
-    return ConnectionPool(access_key=api_key, certificates={test_addr: test_cert_path}, max_conn_per_node=2)
+    cfg = get_config(path / 'config.cfg')
+    return ConnectionPool(api_key=cfg.api_key.open().read(),
+                          certificates={test_addr: cfg.ssl_cert},
+                          max_conn_per_node=2,
+                          port=cfg.server_port)
 
 
 @pytest.mark.asyncio
@@ -46,30 +54,31 @@ async def test_ping(rpc_node: IAgentRPCNode):
 
 @pytest.mark.asyncio
 async def test_read(rpc_node: IAgentRPCNode):
+    cfg = get_config(path / 'config.cfg')
     async with rpc_node:
-        expected_data = test_cert_path.open("rb").read()
+        expected_data = cfg.ssl_cert.open("rb").read()
 
-        data = await rpc_node.read(test_cert_path, compress=False)
+        data = await rpc_node.read(cfg.ssl_cert, compress=False)
         assert data == expected_data
 
-        data = await rpc_node.read(test_cert_path, compress=True)
+        data = await rpc_node.read(cfg.ssl_cert, compress=True)
         assert data == expected_data
 
-        data = await rpc_node.read(test_cert_path)
+        data = await rpc_node.read(cfg.ssl_cert)
         assert data == expected_data
 
-        with test_cert_path.open('rb') as fd:
-            async for block in rpc_node.iter_file(test_cert_path, compress=True):
+        with cfg.ssl_cert.open('rb') as fd:
+            async for block in rpc_node.iter_file(cfg.ssl_cert, compress=True):
                 assert fd.read(len(block)) == block
             assert fd.read() == b''
 
-        with test_cert_path.open('rb') as fd:
-            async for block in rpc_node.iter_file(test_cert_path, compress=False):
+        with cfg.ssl_cert.open('rb') as fd:
+            async for block in rpc_node.iter_file(cfg.ssl_cert, compress=False):
                 assert fd.read(len(block)) == block
             assert fd.read() == b''
 
-        with test_cert_path.open('rb') as fd:
-            async for block in rpc_node.iter_file(test_cert_path):
+        with cfg.ssl_cert.open('rb') as fd:
+            async for block in rpc_node.iter_file(cfg.ssl_cert):
                 assert fd.read(len(block)) == block
             assert fd.read() == b''
 

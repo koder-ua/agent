@@ -1,4 +1,5 @@
 import abc
+import json
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -14,17 +15,18 @@ import collections
 from typing import Iterator, List, Dict, Tuple, Any, Callable, Set, Iterable, Coroutine, Optional, AsyncIterator
 from collections import defaultdict
 
-from koder_utils import LocalHost
+from koder_utils import LocalHost, b2ssize
 from cephlib import (RecId, CephCLI, CephOp, ParseResult, RecordFile, CephHealth, iter_log_messages, iter_ceph_logs_fd,
                      CephRelease, OpRec, IPacker, get_historic_packer, get_ceph_version)
 
-from . import expose_func, IReadableAsync, ChunkedFile, expose_type, get_current_config
+from . import expose_func, IReadableAsync, ChunkedFile, expose_type, get_current_config, register_startup, \
+    register_shutdown
 from . import DEFAULT_ENVIRON
 
 
 expose = functools.partial(expose_func, "ceph")
 
-logger = logging.getLogger("agent.ceph")
+logger = logging.getLogger("agent")
 
 
 def almost_sorted_ceph_log_messages(sort_buffer_size: int) -> Iterator[Tuple[float, CephHealth]]:
@@ -118,6 +120,11 @@ class HistoricCollectionConfig:
     min_device_free: int = DEFAULT_MIN_DEVICE_FREE
     collection_end_time: Optional[float] = None
     packer_name: str = 'compact'
+    cmd_timeout: float = 50
+
+    def __str__(self) -> str:
+        attrs = "\n     ".join(f"{name}: {getattr(self, name)!r}" for name in self.__dataclass_fields__)
+        return f"{self.__class__.__name__}:\n    {attrs}"
 
 
 class LoopCmd(Enum):
@@ -159,7 +166,7 @@ class DumpHistoric(Recorder):
     def __init__(self, evt: asyncio.Event, cli: CephCLI, cfg: HistoricCollectionConfig,
                  record_file: RecordFile, packer: IPacker) -> None:
         Recorder.__init__(self, evt, cli, cfg, record_file, packer)
-        self.osd_ids = []
+        self.osd_ids = self.cfg.osd_ids.copy()
         self.not_inited_osd: Set[int] = set()
         self.pools_map: Dict[int, Tuple[str, int]] = {}
         self.pools_map_no_name: Dict[int, int] = {}
@@ -186,19 +193,24 @@ class DumpHistoric(Recorder):
             if not await self.cli.set_history_size_duration(osd_id, self.cfg.size, self.cfg.duration):
                 self.not_inited_osd.add(osd_id)
 
+        # logger.debug(f"all_odsd={self.osd_ids} not_inited_osd={self.not_inited_osd}, inited_osd={set(self.osd_ids).difference(self.not_inited_osd)}")
         new_rec = await self.reload_pools()
         if new_rec:
+            # logger.debug(f"Get new pools rec")
             # pools updated - skip this cycle, as different ops may came from pools before and after update
             yield new_rec
         else:
+            # logger.debug(f"Dumping osds {set(self.osd_ids).difference(self.not_inited_osd)}")
             for osd_id in set(self.osd_ids).difference(self.not_inited_osd):
                 try:
                     parsed = await self.cli.get_historic(osd_id)
-                except (subprocess.CalledProcessError, OSError):
+                except (subprocess.CalledProcessError, OSError) as exc:
+                    # logger.debug("During op parsing")
                     self.not_inited_osd.add(osd_id)
                     continue
 
                 if self.cfg.size != parsed['size'] or self.cfg.duration != parsed['duration']:
+                    # logger.debug("Incorrect size or duration")
                     self.not_inited_osd.add(osd_id)
                     continue
 
@@ -210,6 +222,7 @@ class DumpHistoric(Recorder):
                         op.pack_pool_id = self.pools_map_no_name[op.pool_id]
                         ops.append(op)
 
+                # logger.debug(f"Find {len(ops)} ops")
                 self.last_time_ops[osd_id] = {op.description for op in ops}
                 yield (RecId.ops, (osd_id, ctime, ops))
 
@@ -222,16 +235,21 @@ class DumpHistoric(Recorder):
                 if ceph_op:
                     yield ceph_op
                 elif parse_res == ParseResult.unknown:
-                    logger.debug(f"Unknown ceph op: {raw_op['description']}")
+                    pass
+                    # logger.debug(f"Unknown ceph op: {raw_op['description']}")
             except Exception as exc:
-                logger.debug(f"Failed to parse op: {exc}\n{pprint.pformat(raw_op)}")
+                # logger.debug(f"Failed to parse op: {exc}\n{pprint.pformat(raw_op)}")
+                pass
 
     async def cycle(self) -> None:
+        bytes = 0
         async for rec_id, data in self.dump_historic():
             rec = self.packer.pack_record(rec_id, data)
             if rec:
+                bytes += len(rec[1])
                 self.record_file.write_record(*rec, flush=False)
         self.record_file.flush()
+        logger.debug(f"Dump osd provides {b2ssize(bytes)}B")
 
     async def close(self) -> None:
         await self.cycle()
@@ -241,13 +259,13 @@ class DumpHistoric(Recorder):
 
 class DumpPGDump(Recorder):
     async def cycle(self) -> None:
-        logger.debug("Run pg dump")
         data = (await self.cli.run_json_raw("pg dump")).strip()
         if data.startswith("dumped all"):
             data = data.replace("dumped all", "", 1).lstrip()
         rec = self.packer.pack_record(RecId.pgdump, data)
         if rec:
             self.record_file.write_record(*rec)
+        logger.debug(f"Pg dump provides {b2ssize(len(rec[1]))}B")
 
 
 class InfoDumper(Recorder):
@@ -265,23 +283,23 @@ class InfoDumper(Recorder):
             rec = self.packer.pack_record(RecId.cluster_info, output)
             if rec:
                 self.record_file.write_record(*rec)
+            logger.debug(f"Cluster info provides {b2ssize(len(rec[1]))}B")
 
 
 @dataclass
 class CephHistoricDumper:
-    def __init__(self, release: CephRelease, record_file_path: Path, cmd_timeout: float,
+    def __init__(self, release: CephRelease, record_file_path: Path,
                  collection_config: HistoricCollectionConfig) -> None:
         self.release = release
         self.record_file_path = record_file_path
-        self.cmd_timeout = cmd_timeout
         self.cfg = collection_config
 
-        self.cli = CephCLI(node=None, extra_params=self.cfg.ceph_extra_args, timeout=self.cmd_timeout,
+        self.cli = CephCLI(node=None, extra_params=self.cfg.ceph_extra_args, timeout=collection_config.cmd_timeout,
                            release=self.release, env=DEFAULT_ENVIRON)
 
         self.packer: IPacker = get_historic_packer(self.cfg.packer_name)
         if not self.record_file_path.exists():
-            self.record_file_path.parent.mkdir(parents=True)
+            self.record_file_path.parent.mkdir(parents=True, exist_ok=True)
             with self.record_file_path.open("wb"):
                 pass
 
@@ -304,15 +322,16 @@ class CephHistoricDumper:
         self.active_loops_tasks = [asyncio.create_task(self.loop(timeout, recorder)) for timeout, recorder in recorders]
 
     def get_free_space(self) -> int:
-        return os.statvfs(str(self.record_file_path)).f_bfree
+        vstat = os.statvfs(str(self.record_file_path))
+        return vstat.f_bfree * vstat.f_bsize
 
     def check_recording_allowed(self) -> bool:
         assert self.cfg
 
         disk_free = self.get_free_space()
         if disk_free <= self.cfg.min_device_free:
-            logger.warning("Stop recording due to disk free space %sMiB less then minimal %sMiB",
-                           disk_free // MiB, self.cfg.min_device_free // MiB)
+            logger.warning("Stop recording due to disk free space %s less then minimal %s",
+                           b2ssize(disk_free), b2ssize(self.cfg.min_device_free))
             return False
 
         if time.time() >= self.cfg.collection_end_time:
@@ -320,14 +339,10 @@ class CephHistoricDumper:
             return False
 
         if self.record_file.tell() >= self.cfg.max_record_file:
-            logger.warning("Stop recording due to record file too large %sMiB, while %sMiB is a limit",
-                           self.record_file.tell() // MiB, self.cfg.max_record_file // MiB)
+            logger.warning("Stop recording due to record file too large - %s, while %s is a limit",
+                           b2ssize(self.record_file.tell()), b2ssize(self.cfg.max_record_file))
             return False
         return True
-
-    def recording_status(self) -> HistoricCollectionStatus:
-        return HistoricCollectionStatus(self.cfg, self.record_fd.name,
-                                        self.get_free_space(), self.record_file.tell())
 
     async def stop(self, timeout=60) -> bool:
         self.exit_evt.set()
@@ -352,11 +367,11 @@ class CephHistoricDumper:
             await recorder.start()
 
             while True:
-                timeout = next_run - time.time()
+                sleep_for = next_run - time.time()
 
-                if timeout > 0:
+                if sleep_for > 0:
                     try:
-                        await asyncio.wait_for(self.exit_evt.wait(), timeout=timeout)
+                        await asyncio.wait_for(self.exit_evt.wait(), timeout=sleep_for)
                         exit_requested = True
                     except asyncio.TimeoutError:
                         pass
@@ -388,44 +403,99 @@ async def start_historic_collection(historic_config: HistoricCollectionConfig) -
     global dumper
     assert dumper is None, "Collection already running"
 
-    version = await get_ceph_version(LocalHost(), extra_args=historic_config.ceph_extra_args)
+    version = await get_ceph_version(LocalHost(), extra_args=historic_config.ceph_extra_args, env=DEFAULT_ENVIRON)
     cfg = get_current_config()
 
     if not cfg.historic_ops.parent.exists():
         cfg.historic_ops.parent.mkdir(parents=True)
 
-    dumper = CephHistoricDumper(version.release, cfg.historic_ops, cfg.cmd_timeout, historic_config)
-    await dumper.start()
+    hc = str(historic_config).replace('\n', '\n    ')
+    logger.info(f"Start historic collection with config:\n    {hc}")
+    dumper = CephHistoricDumper(version.release, cfg.historic_ops, historic_config)
+    dumper.start()
+    cfg_path = cfg.historic_ops.parent / 'agent_historic_cfg.json'
+
+    with cfg_path.open("w") as fd:
+        logger.exception(f"Storing historic config to {cfg_path}")
+        fd.write(json.dumps(historic_config.__dict__))
 
 
 @expose
-async def stop_historic_collection() -> None:
+async def stop_historic_collection(not_err: bool = False) -> None:
     global dumper
-    assert dumper
-    assert await dumper.close(), "Not all loops finised successfully"
+    if not dumper:
+        if not_err:
+            return
+        assert False, "Not running"
+
+    cfg = get_current_config()
+
+    cfg_path = cfg.historic_ops.parent / 'agent_historic_cfg.json'
+    if cfg_path.exists:
+        cfg_path.unlink()
+
+    assert await dumper.stop(), "Not all loops finised successfully"
     dumper = None
 
 
 @expose
 async def remove_historic_data() -> None:
-    assert not dumper
+    assert not dumper, "Collection running. Stop first"
     get_current_config().historic_ops.unlink()
 
 
 @expose
-def get_historic_collection_status() -> Optional[HistoricCollectionStatus]:
-    if dumper:
-        return dumper.recording_status()
-    return None
+def get_historic_collection_status() -> HistoricCollectionStatus:
+    cfg = get_current_config()
+    record_cfg = None if not dumper else dumper.cfg
+    try:
+        vstat = os.statvfs(str(cfg.historic_ops))
+        free = vstat.f_bfree * vstat.f_bsize
+    except OSError:
+        free = 0
+
+    size = 0
+    try:
+        if cfg.historic_ops.exists():
+            size = cfg.historic_ops.stat().st_size
+    except OSError:
+        pass
+
+    return HistoricCollectionStatus(record_cfg,
+                                    str(cfg.historic_ops),
+                                    disk_free_space=free,
+                                    file_size=size)
 
 
 @expose
 def get_collected_historic_data(offset: int, size: int = None) -> IReadableAsync:
-    assert dumper
-    rfd = dumper.record_file_path.open("rb")
+    cfg = get_current_config()
+    assert cfg.historic_ops.exists(), f"File {cfg.historic_ops} with ops not found"
+    rfd = cfg.historic_ops.open("rb")
     if offset:
         rfd.seek(offset)
 
     return ChunkedFile(rfd,
                        close_at_the_end=True,
                        till_offset=offset + size if size is not None else None)
+
+
+@register_startup
+async def restore_collection(app: Any):
+    cfg = get_current_config()
+    cfg_path = cfg.historic_ops.parent / 'agent_historic_cfg.json'
+
+    if cfg_path.exists:
+        try:
+            historic_config_dct = json.load(cfg_path.exists.open())
+            historic_config = HistoricCollectionConfig(**historic_config_dct)
+        except:
+            logger.exception(f"Can't load historic config from {cfg_path}")
+            return
+
+        await start_historic_collection(historic_config)
+
+
+@register_shutdown
+async def stop_collection(app: Any):
+    await stop_historic_collection(not_err=True)

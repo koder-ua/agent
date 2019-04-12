@@ -5,12 +5,13 @@ import argparse
 import traceback
 import subprocess
 import logging.config
+from pathlib import Path
 from typing import List, Dict, Any
 
 from aiohttp import web, BasicAuth
 
-from .plugins import DEFAULT_HTTP_CHUNK, exposed, exposed_async, CONFIG_OBJ
-from .common import USER_NAME, MAX_FILE_SIZE, get_config, get_key_enc, encrypt_key, AgentConfig
+from .plugins import DEFAULT_HTTP_CHUNK, exposed, exposed_async, CONFIG_OBJ, on_server_startup, on_server_shutdown
+from .common import USER_NAME, MAX_FILE_SIZE, get_config, get_key_enc, encrypt_key, AgentConfig, config_logging
 from . import rpc
 
 
@@ -48,33 +49,38 @@ class RPCRequest:
 
 
 async def send_body(is_ok: bool, result: Any, writer):
-
     if not is_ok:
         if isinstance(result, subprocess.TimeoutExpired):
             args = (result.cmd, result.timeout, result.stdout, result.stderr)
+        elif isinstance(result, subprocess.CalledProcessError):
+            args = (result.returncode, result.cmd, result.stdout, result.stderr)
         else:
             args = result.args
 
         result = result.__class__.__name__, args, traceback.format_exc()
-
     async for chunk in rpc.serialize(rpc.CALL_SUCCEEDED if is_ok else rpc.CALL_FAILED, [result], {}):
         await writer.write(chunk)
 
 
 async def handle_post(request: web.Request):
-    req = RPCRequest(*(await rpc.deserialize(request.content.iter_chunked(DEFAULT_HTTP_CHUNK), allow_streamed=True)))
-    responce = web.StreamResponse(status=http.HTTPStatus.OK, headers={'Content-Encoding': 'identity'})
-    await responce.prepare(request)
     try:
-        if req.func_name in exposed_async:
-            res = await exposed_async[req.func_name](*req.args, **req.kwargs)
+        req = RPCRequest(*(await rpc.deserialize(request.content.iter_chunked(DEFAULT_HTTP_CHUNK),
+                         allow_streamed=True)))
+        responce = web.StreamResponse(status=http.HTTPStatus.OK, headers={'Content-Encoding': 'identity'})
+        await responce.prepare(request)
+        try:
+            if req.func_name in exposed_async:
+                res = await exposed_async[req.func_name](*req.args, **req.kwargs)
+            else:
+                res = exposed[req.func_name](*req.args, **req.kwargs)
+        except Exception as exc:
+            await send_body(False, exc, responce)
         else:
-            res = exposed[req.func_name](*req.args, **req.kwargs)
-    except Exception as exc:
-        await send_body(False, exc, responce)
-    else:
-        await send_body(True, res, responce)
-    return responce
+            await send_body(True, res, responce)
+        return responce
+    except:
+        logger.exception("During send body")
+        raise
 
 
 async def handle_ping(request: web.Request):
@@ -96,6 +102,13 @@ def start_rpc_server(cfg: AgentConfig):
     app = web.Application(middlewares=[auth], client_max_size=MAX_FILE_SIZE)
     app.add_routes([web.post('/conn', handle_post)])
     app.add_routes([web.get('/ping', handle_ping)])
+
+    for func in on_server_startup:
+        app.on_startup.append(func)
+
+    for func in on_server_shutdown:
+        app.on_cleanup.append(func)
+
     web.run_app(app, host=host, port=int(port), ssl_context=ssl_context)
 
 
@@ -110,7 +123,8 @@ def parse_args(argv: List[str]):
 
 def main(argv: List[str]) -> int:
     opts = parse_args(argv)
-    cfg = get_config(opts.config)
+    cfg = get_config(Path(opts.config))
+    config_logging(cfg)
 
     if opts.subparser_name == 'server':
         # share config with plugins

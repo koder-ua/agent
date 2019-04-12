@@ -13,8 +13,6 @@ readonly AGENT_PATH=$(dirname $(realpath "${0}"))
 readonly MAKE_ARCH_LIB=$(python -c "import koder_utils ; print(koder_utils.__file__)")
 readonly MAKE_ARCH_LIB_PATH=$(dirname $(realpath "${MAKE_ARCH_LIB}"))
 readonly CONTAINER_ID="${1}"
-readonly DEPLOY_RUN_FOLDER=/tmp
-
 readonly ARCH_PATH="${AGENT_PATH}/arch/agent.sh"
 
 
@@ -41,25 +39,27 @@ function redeploy {
     local -r install_path="${1}"
     local -r inventory="${2}"
     local -r arch_path="${3}"
-    local -r deploy_run_folder="${4}"
 
     # install locally
     rm -rf "${install_path}/*"
     bash "${arch_path}" --install "${install_path}"
 
-#    pushd "${deploy_run_folder}"
-#    # redeploy
-#    bash "${install_path}/ctl" uninstall --inventory "${inventory}"
-#    bash "${install_path}/ctl" install --inventory "${inventory}"
-#
-#    # show status
-#    sleep 1
-#    bash "${install_path}/ctl" status --inventory "${inventory}"
-#    popd
+    local -r ctl="${install_path}/python/python3.7 -m agent.ctl"
+
+    pushd "${install_path}"
+
+    # redeploy
+    ${ctl} uninstall --inventory "${inventory}"
+    ${ctl} install --inventory "${inventory}"
+
+    # show status
+    sleep 1
+    ${ctl} status
+    popd >/dev/null 2>&1
 }
 
 build "${CONTAINER_ID}" "${AGENT_PATH}" "${MAKE_ARCH_LIB_PATH}" "${ARCH_PATH}"
 
 readonly INSTALL_TO="${2}"
 readonly INVENTORY="${3}"
-redeploy "${INSTALL_TO}" "${INVENTORY}" "${ARCH_PATH}" "${DEPLOY_RUN_FOLDER}"
+redeploy "${INSTALL_TO}" "${INVENTORY}" "${ARCH_PATH}"
